@@ -197,10 +197,15 @@ func (c *ChatClient) handleUDPMessage(msg *common.Message, srcIP string) {
 			if isNew {
 				// 只有新用户才公告上线
 				fmt.Printf("🎉 [系统] %s 上线了!\n", msg.From)
+				// 发现新用户时，再次广播自己的上线通知
+				go c.broadcastOnline()
 			}
 			if changed {
 				c.printOnlinePeers()
 			}
+		} else if isNew {
+			// 即使在聊天中，发现新用户时也需要广播自己的上线通知
+			go c.broadcastOnline()
 		}
 	case common.MsgTypeOffline:
 		// 处理下线通知
