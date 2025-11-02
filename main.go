@@ -31,6 +31,20 @@ type TransferringFile struct {
 	TotalChunks  int
 	CurrentChunk int
 	Buffer       []byte
+	RelativePath string // 相对路径（用于文件夹传输）
+	FolderID     string // 所属文件夹ID（如果是文件夹传输中的文件）
+}
+
+// 文件夹传输信息
+type TransferringFolder struct {
+	FolderPath  string
+	FolderName  string
+	FolderSize  int64
+	FileCount   int
+	FolderID    string
+	CurrentFile int
+	TotalFiles  int
+	Files       []string // 文件列表
 }
 
 type ChatClient struct {
@@ -57,6 +71,9 @@ type ChatClient struct {
 	// 传输中的文件映射
 	sendingFiles   map[string]*TransferringFile // fileID -> 文件信息
 	receivingFiles map[string]*TransferringFile // fileID -> 文件信息
+	// 文件夹传输相关字段
+	sendingFolders   map[string]*TransferringFolder // folderID -> 文件夹信息
+	receivingFolders map[string]*TransferringFolder // folderID -> 文件夹信息
 }
 
 func NewChatClient() *ChatClient {
@@ -67,15 +84,17 @@ func NewChatClient() *ChatClient {
 	}
 
 	client := &ChatClient{
-		peers:          make(map[string]*common.Peer),
-		online:         true,
-		localIP:        getLocalIP(),
-		announcedPeers: make(map[string]bool),
-		fileDataDir:    dataDir,
-		transmitting:   false,
-		receiving:      false,
-		sendingFiles:   make(map[string]*TransferringFile),
-		receivingFiles: make(map[string]*TransferringFile),
+		peers:            make(map[string]*common.Peer),
+		online:           true,
+		localIP:          getLocalIP(),
+		announcedPeers:   make(map[string]bool),
+		fileDataDir:      dataDir,
+		transmitting:     false,
+		receiving:        false,
+		sendingFiles:     make(map[string]*TransferringFile),
+		receivingFiles:   make(map[string]*TransferringFile),
+		sendingFolders:   make(map[string]*TransferringFolder),
+		receivingFolders: make(map[string]*TransferringFolder),
 	}
 	return client
 }
@@ -345,6 +364,12 @@ func (c *ChatClient) handleIncomingConnection(conn net.Conn) {
 		case common.MsgTypeFileAccept, common.MsgTypeFileReject, common.MsgTypeFileData, common.MsgTypeFileDone, common.MsgTypeFileCancel:
 			// 处理其他文件传输相关消息
 			go c.handleFileMessage(&msg, conn)
+		case common.MsgTypeFolderOffer:
+			// 处理文件夹发送请求
+			go c.handleFolderOffer(&msg, conn)
+		case common.MsgTypeFolderAccept, common.MsgTypeFolderReject, common.MsgTypeFolderDone:
+			// 处理文件夹传输相关消息
+			go c.handleFolderMessage(&msg, conn)
 		}
 	}
 }
@@ -517,6 +542,12 @@ func (c *ChatClient) receiveChatMessages(conn net.Conn) {
 		case common.MsgTypeFileAccept, common.MsgTypeFileReject, common.MsgTypeFileData, common.MsgTypeFileDone, common.MsgTypeFileCancel:
 			// 处理其他文件传输相关消息
 			go c.handleFileMessage(&msg, conn)
+		case common.MsgTypeFolderOffer:
+			// 处理文件夹发送请求
+			go c.handleFolderOffer(&msg, conn)
+		case common.MsgTypeFolderAccept, common.MsgTypeFolderReject, common.MsgTypeFolderDone:
+			// 处理文件夹传输相关消息
+			go c.handleFolderMessage(&msg, conn)
 		}
 	}
 }
@@ -792,6 +823,7 @@ func (c *ChatClient) handleUserInput() {
 	fmt.Println("/list - 显示在线用户")
 	fmt.Println("/chat <用户名> - 开始与用户聊天")
 	fmt.Println("/sendfile <文件路径> - 在聊天中发送文件")
+	fmt.Println("/sendfolder <文件夹路径> - 在聊天中发送文件夹")
 	fmt.Println("/quit - 退出程序")
 	fmt.Println()
 
@@ -820,6 +852,16 @@ func (c *ChatClient) handleUserInput() {
 				} else {
 					fmt.Println("用法: /sendfile <文件路径>")
 					fmt.Println("示例: /sendfile C:\\Users\\Documents\\example.txt")
+					fmt.Print("你: ")
+				}
+			} else if strings.HasPrefix(input, "/sendfolder ") {
+				parts := strings.SplitN(input, " ", 2)
+				if len(parts) >= 2 {
+					folderPath := strings.TrimSpace(parts[1])
+					c.sendFolder(folderPath)
+				} else {
+					fmt.Println("用法: /sendfolder <文件夹路径>")
+					fmt.Println("示例: /sendfolder C:\\Users\\Documents\\folder")
 					fmt.Print("你: ")
 				}
 			} else {
@@ -857,6 +899,7 @@ func (c *ChatClient) handleUserInput() {
 				fmt.Println("/list - 显示在线用户")
 				fmt.Println("/chat <用户名> - 开始与用户聊天")
 				fmt.Println("/sendfile <文件路径> - 在聊天中发送文件")
+				fmt.Println("/sendfolder <文件夹路径> - 在聊天中发送文件夹")
 				fmt.Println("/quit - 退出程序")
 				fmt.Println()
 			default:
@@ -1027,14 +1070,19 @@ func (c *ChatClient) cleanupReceivingFile(fileID string) {
 			file.File.Close()
 		}
 		delete(c.receivingFiles, fileID)
+
+		// 如果是普通文件传输，设置receiving为false
+		if file.FolderID == "" {
+			c.receiving = false
+		}
 	}
-	c.receiving = false
 }
 
 // 处理文件发送请求
 func (c *ChatClient) handleFileOffer(msg *common.Message, conn net.Conn) {
 	c.fileMutex.Lock()
-	if c.receiving {
+	isFolderFile := msg.FolderID != ""
+	if c.receiving && !isFolderFile {
 		c.fileMutex.Unlock()
 		// 发送拒绝消息
 		rejectMsg := common.Message{
@@ -1046,64 +1094,97 @@ func (c *ChatClient) handleFileOffer(msg *common.Message, conn net.Conn) {
 		conn.Write(append(data, '\n'))
 		return
 	}
-	c.receiving = true
+	if !isFolderFile {
+		c.receiving = true
+	}
 	c.fileMutex.Unlock()
 
-	// 显示文件信息并询问是否接受
-	fmt.Printf("\n📥 %s 向你发送文件:\n", msg.From)
-	fmt.Printf("文件名: %s\n", msg.FileName)
-	fmt.Printf("文件大小: %s\n", formatFileSize(msg.FileSize))
-	fmt.Print("是否接受文件？(y/n): ")
+	var savePath string
+	var folderPath string
 
-	reader := bufio.NewReader(os.Stdin)
-	response, _ := reader.ReadString('\n')
-	response = strings.TrimSpace(response)
-
-	if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
-		// 拒绝文件
-		rejectMsg := common.Message{
-			Type:   common.MsgTypeFileReject,
-			From:   c.name,
-			FileID: msg.FileID,
-		}
-		data, _ := json.Marshal(rejectMsg)
-		conn.Write(append(data, '\n'))
-		fmt.Println("文件传输已取消")
-		if c.inChatSession {
-			fmt.Print("你: ")
-		}
+	if isFolderFile {
+		// 是文件夹中的文件，使用文件夹保存路径
 		c.fileMutex.Lock()
-		c.receiving = false
+		folderInfo, exists := c.receivingFolders[msg.FolderID]
 		c.fileMutex.Unlock()
-		return
-	}
+		if !exists {
+			fmt.Printf("找不到对应的文件夹信息\n")
+			return
+		}
 
-	// 创建保存文件的完整路径
-	savePath := filepath.Join(c.fileDataDir, msg.FileName)
+		folderPath = folderInfo.FolderPath
+		// 根据相对路径创建目录结构
+		if msg.RelativePath != "" {
+			savePath = filepath.Join(folderPath, msg.RelativePath)
+		} else {
+			savePath = filepath.Join(folderPath, msg.FileName)
+		}
 
-	// 检查文件是否已存在，如果存在则添加时间戳
-	if _, err := os.Stat(savePath); err == nil {
-		timestamp := time.Now().Format("20060102_150405")
-		ext := filepath.Ext(msg.FileName)
-		baseName := strings.TrimSuffix(msg.FileName, ext)
-		savePath = filepath.Join(c.fileDataDir, fmt.Sprintf("%s_%s%s", baseName, timestamp, ext))
+		// 创建必要的目录结构
+		dir := filepath.Dir(savePath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fmt.Printf("创建目录失败: %v\n", err)
+			return
+		}
+	} else {
+		// 显示文件信息并询问是否接受
+		fmt.Printf("\n📥 %s 向你发送文件:\n", msg.From)
+		fmt.Printf("文件名: %s\n", msg.FileName)
+		fmt.Printf("文件大小: %s\n", formatFileSize(msg.FileSize))
+		fmt.Print("是否接受文件？(y/n): ")
+
+		reader := bufio.NewReader(os.Stdin)
+		response, _ := reader.ReadString('\n')
+		response = strings.TrimSpace(response)
+
+		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+			// 拒绝文件
+			rejectMsg := common.Message{
+				Type:   common.MsgTypeFileReject,
+				From:   c.name,
+				FileID: msg.FileID,
+			}
+			data, _ := json.Marshal(rejectMsg)
+			conn.Write(append(data, '\n'))
+			fmt.Println("文件传输已取消")
+			if c.inChatSession {
+				fmt.Print("你: ")
+			}
+			c.fileMutex.Lock()
+			c.receiving = false
+			c.fileMutex.Unlock()
+			return
+		}
+
+		// 创建保存文件的完整路径
+		savePath = filepath.Join(c.fileDataDir, msg.FileName)
+
+		// 检查文件是否已存在，如果存在则添加时间戳
+		if _, err := os.Stat(savePath); err == nil {
+			timestamp := time.Now().Format("20060102_150405")
+			ext := filepath.Ext(msg.FileName)
+			baseName := strings.TrimSuffix(msg.FileName, ext)
+			savePath = filepath.Join(c.fileDataDir, fmt.Sprintf("%s_%s%s", baseName, timestamp, ext))
+		}
 	}
 
 	// 创建文件用于保存
 	file, err := os.Create(savePath)
 	if err != nil {
 		fmt.Printf("创建文件失败: %v\n", err)
-		// 发送拒绝消息
-		rejectMsg := common.Message{
-			Type:   common.MsgTypeFileReject,
-			From:   c.name,
-			FileID: msg.FileID,
+		if !isFolderFile {
+			// 发送拒绝消息
+			rejectMsg := common.Message{
+				Type:   common.MsgTypeFileReject,
+				From:   c.name,
+				FileID: msg.FileID,
+			}
+			data, _ := json.Marshal(rejectMsg)
+			conn.Write(append(data, '\n'))
+			c.fileMutex.Lock()
+			c.receiving = false
+			c.fileMutex.Unlock()
 		}
-		data, _ := json.Marshal(rejectMsg)
-		conn.Write(append(data, '\n'))
-		c.fileMutex.Lock()
-		c.receiving = false
-		c.fileMutex.Unlock()
 		if c.inChatSession {
 			fmt.Print("你: ")
 		}
@@ -1119,6 +1200,8 @@ func (c *ChatClient) handleFileOffer(msg *common.Message, conn net.Conn) {
 		File:         file,
 		TotalChunks:  msg.TotalChunks,
 		CurrentChunk: 0,
+		RelativePath: msg.RelativePath,
+		FolderID:     msg.FolderID,
 	}
 
 	c.fileMutex.Lock()
@@ -1135,8 +1218,19 @@ func (c *ChatClient) handleFileOffer(msg *common.Message, conn net.Conn) {
 	conn.Write(append(data, '\n'))
 
 	// 准备接收文件数据
-	fmt.Printf("开始接收文件: %s\n", msg.FileName)
-	fmt.Printf("保存路径: %s\n", savePath)
+	if !isFolderFile {
+		fmt.Printf("开始接收文件: %s\n", msg.FileName)
+		fmt.Printf("保存路径: %s\n", savePath)
+	} else {
+		// 文件夹中的文件，不显示单独的接收提示
+		c.fileMutex.Lock()
+		if folderInfo, exists := c.receivingFolders[msg.FolderID]; exists {
+			folderInfo.CurrentFile++
+			fileProgress := int(float64(folderInfo.CurrentFile) / float64(folderInfo.TotalFiles) * 100)
+			fmt.Printf("文件夹接收进度: %d%% (%d/%d 个文件)\r", fileProgress, folderInfo.CurrentFile, folderInfo.TotalFiles)
+		}
+		c.fileMutex.Unlock()
+	}
 
 	if c.inChatSession {
 		fmt.Print("你: ")
@@ -1152,8 +1246,8 @@ func (c *ChatClient) handleFileMessage(msg *common.Message, _ net.Conn) {
 	case common.MsgTypeFileReject:
 		// 对方拒绝了文件
 		c.fileMutex.Lock()
+		defer c.fileMutex.Unlock()
 		c.transmitting = false
-		c.fileMutex.Unlock()
 		fmt.Printf("\n❌ %s 拒绝了你的文件\n", msg.From)
 		if c.inChatSession {
 			fmt.Print("你: ")
@@ -1164,8 +1258,8 @@ func (c *ChatClient) handleFileMessage(msg *common.Message, _ net.Conn) {
 	case common.MsgTypeFileDone:
 		// 文件传输完成
 		c.fileMutex.Lock()
+		defer c.fileMutex.Unlock()
 		c.receiving = false
-		c.fileMutex.Unlock()
 		fmt.Printf("\n✅ 文件 '%s' 接收完成，已保存到: %s\n", msg.FileName, c.fileDataDir)
 		if c.inChatSession {
 			fmt.Print("你: ")
@@ -1173,14 +1267,390 @@ func (c *ChatClient) handleFileMessage(msg *common.Message, _ net.Conn) {
 	case common.MsgTypeFileCancel:
 		// 文件传输取消
 		c.fileMutex.Lock()
+		defer c.fileMutex.Unlock()
 		c.transmitting = false
 		c.receiving = false
-		c.fileMutex.Unlock()
 		fmt.Printf("\n❌ 文件传输已取消\n")
 		if c.inChatSession {
 			fmt.Print("你: ")
 		}
 	}
+}
+
+// 处理文件夹传输相关消息
+func (c *ChatClient) handleFolderMessage(msg *common.Message, _ net.Conn) {
+	switch msg.Type {
+	case common.MsgTypeFolderAccept:
+		// 对方接受了文件夹，开始发送文件夹内容
+		go c.sendFilesInFolder(msg.FolderID)
+	case common.MsgTypeFolderReject:
+		// 对方拒绝了文件夹
+		c.fileMutex.Lock()
+		defer c.fileMutex.Unlock()
+		c.transmitting = false
+		fmt.Printf("\n❌ %s 拒绝了你的文件夹\n", msg.From)
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+	case common.MsgTypeFolderDone:
+		// 文件夹传输完成
+		c.fileMutex.Lock()
+		defer c.fileMutex.Unlock()
+		if _, exists := c.receivingFolders[msg.FolderID]; exists {
+			delete(c.receivingFolders, msg.FolderID)
+			c.receiving = false
+		}
+		fmt.Printf("\n✅ 文件夹 '%s' 接收完成，已保存到: %s\n", msg.FolderName, filepath.Join(c.fileDataDir, msg.FolderName))
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+	}
+}
+
+// 扫描文件夹内容
+func scanFolder(folderPath string) ([]string, int64, error) {
+	var files []string
+	var totalSize int64
+
+	err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			files = append(files, path)
+			totalSize += info.Size()
+		}
+		return nil
+	})
+
+	return files, totalSize, err
+}
+
+// 发送文件夹
+func (c *ChatClient) sendFolder(folderPath string) {
+	if !c.inChatSession {
+		fmt.Println("请先开始一个聊天会话")
+		fmt.Print("你: ")
+		return
+	}
+
+	// 检查文件夹是否存在
+	folderInfo, err := os.Stat(folderPath)
+	if err != nil || !folderInfo.IsDir() {
+		fmt.Printf("文件夹不存在或无效: %v\n", err)
+		fmt.Print("你: ")
+		return
+	}
+
+	c.fileMutex.Lock()
+	if c.transmitting {
+		c.fileMutex.Unlock()
+		fmt.Println("正在进行文件传输，请等待完成")
+		fmt.Print("你: ")
+		return
+	}
+	c.transmitting = true
+	c.fileMutex.Unlock()
+
+	// 扫描文件夹内容
+	files, totalSize, err := scanFolder(folderPath)
+	if err != nil {
+		fmt.Printf("扫描文件夹失败: %v\n", err)
+		c.fileMutex.Lock()
+		c.transmitting = false
+		c.fileMutex.Unlock()
+		fmt.Print("你: ")
+		return
+	}
+
+	if len(files) == 0 {
+		fmt.Println("文件夹为空")
+		c.fileMutex.Lock()
+		c.transmitting = false
+		c.fileMutex.Unlock()
+		fmt.Print("你: ")
+		return
+	}
+
+	// 生成文件夹ID
+	folderID := generateFileID()
+
+	// 创建文件夹传输信息
+	folderName := folderInfo.Name()
+	transferFolder := &TransferringFolder{
+		FolderPath:  folderPath,
+		FolderName:  folderName,
+		FolderSize:  totalSize,
+		FileCount:   len(files),
+		FolderID:    folderID,
+		CurrentFile: 0,
+		TotalFiles:  len(files),
+		Files:       files,
+	}
+
+	c.fileMutex.Lock()
+	c.sendingFolders[folderID] = transferFolder
+	c.fileMutex.Unlock()
+
+	// 发送文件夹请求
+	folderOfferMsg := common.Message{
+		Type:       common.MsgTypeFolderOffer,
+		From:       c.name,
+		FolderName: folderName,
+		FolderSize: totalSize,
+		FileCount:  len(files),
+		FolderID:   folderID,
+	}
+
+	data, _ := json.Marshal(folderOfferMsg)
+	_, err = c.chatConn.Write(append(data, '\n'))
+	if err != nil {
+		c.cleanupSendingFolder(folderID)
+		fmt.Printf("发送文件夹请求失败: %v\n", err)
+		fmt.Print("你: ")
+		return
+	}
+
+	fmt.Printf("📤 发送文件夹请求: %s (%s, %d 个文件)\n", folderName, formatFileSize(totalSize), len(files))
+	fmt.Println("等待对方接受...")
+
+	fmt.Print("你: ")
+}
+
+// 处理文件夹发送请求
+func (c *ChatClient) handleFolderOffer(msg *common.Message, conn net.Conn) {
+	c.fileMutex.Lock()
+	if c.receiving {
+		c.fileMutex.Unlock()
+		// 发送拒绝消息
+		rejectMsg := common.Message{
+			Type:     common.MsgTypeFolderReject,
+			From:     c.name,
+			FolderID: msg.FolderID,
+		}
+		data, _ := json.Marshal(rejectMsg)
+		conn.Write(append(data, '\n'))
+		return
+	}
+	c.receiving = true
+	c.fileMutex.Unlock()
+
+	// 显示文件夹信息并询问是否接受
+	fmt.Printf("\n📥 %s 向你发送文件夹:\n", msg.From)
+	fmt.Printf("文件夹名: %s\n", msg.FolderName)
+	fmt.Printf("总大小: %s\n", formatFileSize(msg.FolderSize))
+	fmt.Printf("文件数量: %d\n", msg.FileCount)
+	fmt.Print("是否接受文件夹？(y/n): ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(response)
+
+	if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+		// 拒绝文件夹
+		rejectMsg := common.Message{
+			Type:     common.MsgTypeFolderReject,
+			From:     c.name,
+			FolderID: msg.FolderID,
+		}
+		data, _ := json.Marshal(rejectMsg)
+		conn.Write(append(data, '\n'))
+		fmt.Println("文件夹传输已取消")
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+		c.fileMutex.Lock()
+		c.receiving = false
+		c.fileMutex.Unlock()
+		return
+	}
+
+	// 创建保存文件夹的完整路径
+	folderSavePath := filepath.Join(c.fileDataDir, msg.FolderName)
+
+	// 检查文件夹是否已存在，如果存在则添加时间戳
+	if _, err := os.Stat(folderSavePath); err == nil {
+		timestamp := time.Now().Format("20060102_150405")
+		folderSavePath = filepath.Join(c.fileDataDir, fmt.Sprintf("%s_%s", msg.FolderName, timestamp))
+	}
+
+	// 创建文件夹
+	if err := os.MkdirAll(folderSavePath, 0755); err != nil {
+		fmt.Printf("创建文件夹失败: %v\n", err)
+		// 发送拒绝消息
+		rejectMsg := common.Message{
+			Type:     common.MsgTypeFolderReject,
+			From:     c.name,
+			FolderID: msg.FolderID,
+		}
+		data, _ := json.Marshal(rejectMsg)
+		conn.Write(append(data, '\n'))
+		c.fileMutex.Lock()
+		c.receiving = false
+		c.fileMutex.Unlock()
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+		return
+	}
+
+	// 保存文件夹传输信息
+	transferFolder := &TransferringFolder{
+		FolderPath:  folderSavePath,
+		FolderName:  msg.FolderName,
+		FolderSize:  msg.FolderSize,
+		FileCount:   msg.FileCount,
+		FolderID:    msg.FolderID,
+		CurrentFile: 0,
+		TotalFiles:  msg.FileCount,
+		Files:       []string{},
+	}
+
+	c.fileMutex.Lock()
+	c.receivingFolders[msg.FolderID] = transferFolder
+	c.fileMutex.Unlock()
+
+	// 接受文件夹
+	acceptMsg := common.Message{
+		Type:     common.MsgTypeFolderAccept,
+		From:     c.name,
+		FolderID: msg.FolderID,
+	}
+	data, _ := json.Marshal(acceptMsg)
+	conn.Write(append(data, '\n'))
+
+	// 准备接收文件夹内容
+	fmt.Printf("开始接收文件夹: %s\n", msg.FolderName)
+	fmt.Printf("保存路径: %s\n", folderSavePath)
+
+	if c.inChatSession {
+		fmt.Print("你: ")
+	}
+}
+
+// 发送文件夹中的文件
+func (c *ChatClient) sendFilesInFolder(folderID string) {
+	c.fileMutex.Lock()
+	transferFolder, exists := c.sendingFolders[folderID]
+	if !exists {
+		c.fileMutex.Unlock()
+		fmt.Println("找不到文件夹传输信息")
+		return
+	}
+	c.fileMutex.Unlock()
+
+	fmt.Printf("开始发送文件夹: %s\n", transferFolder.FolderName)
+
+	// 发送每个文件
+	for transferFolder.CurrentFile < transferFolder.TotalFiles {
+		filePath := transferFolder.Files[transferFolder.CurrentFile]
+
+		// 计算相对路径
+		relativePath, err := filepath.Rel(transferFolder.FolderPath, filePath)
+		if err != nil {
+			relativePath = filepath.Base(filePath)
+		}
+
+		// 获取文件信息
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			fmt.Printf("获取文件信息失败: %v\n", err)
+			transferFolder.CurrentFile++
+			continue
+		}
+
+		// 打开文件
+		file, err := os.Open(filePath)
+		if err != nil {
+			fmt.Printf("打开文件失败: %v\n", err)
+			transferFolder.CurrentFile++
+			continue
+		}
+
+		fileSize := fileInfo.Size()
+		fileName := filepath.Base(filePath)
+		fileID := generateFileID()
+		const chunkSize = 16 * 1024
+		totalChunks := int((fileSize + int64(chunkSize) - 1) / int64(chunkSize))
+
+		// 创建传输文件信息
+		transferFile := &TransferringFile{
+			FilePath:     filePath,
+			FileName:     fileName,
+			FileSize:     fileSize,
+			FileID:       fileID,
+			File:         file,
+			TotalChunks:  totalChunks,
+			CurrentChunk: 0,
+			Buffer:       make([]byte, chunkSize),
+			RelativePath: relativePath,
+			FolderID:     folderID,
+		}
+
+		c.fileMutex.Lock()
+		c.sendingFiles[fileID] = transferFile
+		c.fileMutex.Unlock()
+
+		// 发送文件信息
+		fileOfferMsg := common.Message{
+			Type:         common.MsgTypeFileOffer,
+			From:         c.name,
+			FileName:     fileName,
+			FileSize:     fileSize,
+			FileID:       fileID,
+			TotalChunks:  totalChunks,
+			FolderID:     folderID,
+			RelativePath: relativePath,
+		}
+
+		data, _ := json.Marshal(fileOfferMsg)
+		_, err = c.chatConn.Write(append(data, '\n'))
+		if err != nil {
+			file.Close()
+			c.cleanupSendingFile(fileID)
+			fmt.Printf("发送文件请求失败: %v\n", err)
+			return
+		}
+
+		// 等待文件接受（在handleFileMessage中处理）
+		// 我们需要等待当前文件传输完成
+		for {
+			c.fileMutex.Lock()
+			_, fileExists := c.sendingFiles[fileID]
+			c.fileMutex.Unlock()
+			if !fileExists {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		transferFolder.CurrentFile++
+		fileProgress := int(float64(transferFolder.CurrentFile) / float64(transferFolder.TotalFiles) * 100)
+		fmt.Printf("文件夹传输进度: %d%% (%d/%d 个文件)\r", fileProgress, transferFolder.CurrentFile, transferFolder.TotalFiles)
+	}
+
+	// 发送文件夹完成消息
+	doneMsg := common.Message{
+		Type:       common.MsgTypeFolderDone,
+		From:       c.name,
+		FolderID:   folderID,
+		FolderName: transferFolder.FolderName,
+	}
+	data, _ := json.Marshal(doneMsg)
+	c.chatConn.Write(append(data, '\n'))
+
+	fmt.Printf("\n✅ 文件夹 '%s' 发送完成\n", transferFolder.FolderName)
+	c.cleanupSendingFolder(folderID)
+}
+
+// 清理发送中的文件夹资源
+func (c *ChatClient) cleanupSendingFolder(folderID string) {
+	c.fileMutex.Lock()
+	defer c.fileMutex.Unlock()
+
+	delete(c.sendingFolders, folderID)
+
+	c.transmitting = false
 }
 
 // 清理发送中的文件资源
