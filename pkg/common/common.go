@@ -4,6 +4,11 @@ import (
 	"encoding/json"
 )
 
+const (
+	BroadcastPort = 9999  // 广播端口
+	TCPPortStart  = 10000 // TCP端口起始
+)
+
 // 消息类型常量
 const (
 	MsgTypeDiscover     = "discover"      // 服务发现
@@ -38,11 +43,11 @@ type Message struct {
 	TotalChunks int    `json:"totalChunks,omitempty"` // 总块数
 	Progress    int    `json:"progress,omitempty"`    // 传输进度百分比
 	// 文件夹传输相关字段
-	FolderName  string `json:"folderName,omitempty"`  // 文件夹名
-	FolderSize  int64  `json:"folderSize,omitempty"`  // 文件夹总大小
-	FileCount   int    `json:"fileCount,omitempty"`   // 文件数量
+	FolderName   string `json:"folderName,omitempty"`   // 文件夹名
+	FolderSize   int64  `json:"folderSize,omitempty"`   // 文件夹总大小
+	FileCount    int    `json:"fileCount,omitempty"`    // 文件数量
 	RelativePath string `json:"relativePath,omitempty"` // 相对路径
-	FolderID    string `json:"folderID,omitempty"`    // 文件夹唯一标识
+	FolderID     string `json:"folderID,omitempty"`     // 文件夹唯一标识
 }
 
 // Peer 对等节点信息
