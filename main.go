@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"localchat/pkg/common"
+	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +20,18 @@ const (
 	BroadcastPort = 9999  // 广播端口
 	TCPPortStart  = 10000 // TCP端口起始
 )
+
+// 传输中的文件信息
+type TransferringFile struct {
+	FilePath   string
+	FileName   string
+	FileSize   int64
+	FileID     string
+	File       *os.File
+	TotalChunks int
+	CurrentChunk int
+	Buffer     []byte
+}
 
 type ChatClient struct {
 	name           string
@@ -35,14 +49,33 @@ type ChatClient struct {
 	chatMutex      sync.Mutex
 	lastPeersHash  string          // 上次在线用户列表的哈希值
 	announcedPeers map[string]bool // 已经公告过的用户
+	// 文件传输相关字段
+	fileMutex      sync.Mutex
+	transmitting   bool
+	receiving      bool
+	fileDataDir    string
+	// 传输中的文件映射
+	sendingFiles   map[string]*TransferringFile    // fileID -> 文件信息
+	receivingFiles map[string]*TransferringFile    // fileID -> 文件信息
 }
 
 func NewChatClient() *ChatClient {
+	// 创建文件保存目录
+	dataDir := "received_files"
+	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+		os.Mkdir(dataDir, 0755)
+	}
+
 	client := &ChatClient{
 		peers:          make(map[string]*common.Peer),
 		online:         true,
 		localIP:        getLocalIP(),
 		announcedPeers: make(map[string]bool),
+		fileDataDir:    dataDir,
+		transmitting:   false,
+		receiving:      false,
+		sendingFiles:   make(map[string]*TransferringFile),
+		receivingFiles: make(map[string]*TransferringFile),
 	}
 	return client
 }
@@ -274,37 +307,44 @@ func (c *ChatClient) handleIncomingConnection(conn net.Conn) {
 			continue
 		}
 
-		if msg.Type == common.MsgTypeChat {
-			if c.inChatSession {
-				// 已经在聊天会话中，直接显示消息
-				if msg.Content == "/quit" {
-					fmt.Printf("\n%s 结束了聊天\n", msg.From)
-					c.endChatSession()
-				} else {
-					fmt.Printf("[%s]: %s\n", msg.From, msg.Content)
+		switch msg.Type {
+				case common.MsgTypeChat:
 					if c.inChatSession {
+						// 已经在聊天会话中，直接显示消息
+						if msg.Content == "/quit" {
+							fmt.Printf("\n%s 结束了聊天\n", msg.From)
+							c.endChatSession()
+						} else {
+							fmt.Printf("[%s]: %s\n", msg.From, msg.Content)
+							if c.inChatSession {
+								fmt.Print("你: ")
+							}
+						}
+					} else {
+						// 不在聊天会话中，自动开始聊天
+						fmt.Printf("\n💬 %s 想与你聊天:\n", msg.From)
+						fmt.Printf("[%s]: %s\n", msg.From, msg.Content)
+
+						// 保存连接并开始聊天会话
+						c.chatMutex.Lock()
+						c.chatConn = conn
+						c.currentChat = msg.From
+						c.inChatSession = true
+						c.chatMutex.Unlock()
+
+						fmt.Printf("\n🎯 开始与 %s 聊天 (输入 /quit 结束聊天)\n", msg.From)
+						fmt.Println("=====================================")
 						fmt.Print("你: ")
+
+						// 继续接收消息
+						go c.receiveChatMessages(conn)
 					}
-				}
-			} else {
-				// 不在聊天会话中，自动开始聊天
-				fmt.Printf("\n💬 %s 想与你聊天:\n", msg.From)
-				fmt.Printf("[%s]: %s\n", msg.From, msg.Content)
-
-				// 保存连接并开始聊天会话
-				c.chatMutex.Lock()
-				c.chatConn = conn
-				c.currentChat = msg.From
-				c.inChatSession = true
-				c.chatMutex.Unlock()
-
-				fmt.Printf("\n🎯 开始与 %s 聊天 (输入 /quit 结束聊天)\n", msg.From)
-				fmt.Println("=====================================")
-				fmt.Print("你: ")
-
-				// 继续接收消息
-				go c.receiveChatMessages(conn)
-			}
+				case common.MsgTypeFileOffer:
+					// 处理文件发送请求
+					go c.handleFileOffer(&msg, conn)
+				case common.MsgTypeFileAccept, common.MsgTypeFileReject, common.MsgTypeFileData, common.MsgTypeFileDone, common.MsgTypeFileCancel:
+					// 处理其他文件传输相关消息
+					go c.handleFileMessage(&msg, conn)
 		}
 	}
 }
@@ -460,16 +500,23 @@ func (c *ChatClient) receiveChatMessages(conn net.Conn) {
 			continue
 		}
 
-		if msg.Type == common.MsgTypeChat {
-			if msg.Content == "/quit" {
-				fmt.Printf("\n%s 结束了聊天\n", msg.From)
-				c.endChatSession()
-			} else {
-				fmt.Printf("\n[%s]: %s\n", msg.From, msg.Content)
-				if c.inChatSession {
-					fmt.Print("你: ")
-				}
-			}
+		switch msg.Type {
+				case common.MsgTypeChat:
+					if msg.Content == "/quit" {
+						fmt.Printf("\n%s 结束了聊天\n", msg.From)
+						c.endChatSession()
+					} else {
+						fmt.Printf("\n[%s]: %s\n", msg.From, msg.Content)
+						if c.inChatSession {
+							fmt.Print("你: ")
+						}
+					}
+				case common.MsgTypeFileOffer:
+					// 处理文件发送请求
+					go c.handleFileOffer(&msg, conn)
+				case common.MsgTypeFileAccept, common.MsgTypeFileReject, common.MsgTypeFileData, common.MsgTypeFileDone, common.MsgTypeFileCancel:
+					// 处理其他文件传输相关消息
+					go c.handleFileMessage(&msg, conn)
 		}
 	}
 }
@@ -744,6 +791,7 @@ func (c *ChatClient) handleUserInput() {
 	fmt.Println("\n可用命令:")
 	fmt.Println("/list - 显示在线用户")
 	fmt.Println("/chat <用户名> - 开始与用户聊天")
+	fmt.Println("/sendfile <文件路径> - 在聊天中发送文件")
 	fmt.Println("/quit - 退出程序")
 	fmt.Println()
 
@@ -764,6 +812,16 @@ func (c *ChatClient) handleUserInput() {
 			if input == "/quit" {
 				fmt.Println("结束聊天...")
 				c.endChatSession()
+			} else if strings.HasPrefix(input, "/sendfile ") {
+				parts := strings.SplitN(input, " ", 2)
+				if len(parts) >= 2 {
+					filePath := strings.TrimSpace(parts[1])
+					c.sendFile(filePath)
+				} else {
+					fmt.Println("用法: /sendfile <文件路径>")
+					fmt.Println("示例: /sendfile C:\\Users\\Documents\\example.txt")
+					fmt.Print("你: ")
+				}
 			} else {
 				// 发送聊天消息
 				if c.sendChatMessage(input) {
@@ -795,11 +853,12 @@ func (c *ChatClient) handleUserInput() {
 					fmt.Println("示例: /chat 张三")
 				}
 			case input == "/help":
-				fmt.Println("\n可用命令:")
-				fmt.Println("/list - 显示在线用户")
-				fmt.Println("/chat <用户名> - 开始与用户聊天")
-				fmt.Println("/quit - 退出程序")
-				fmt.Println()
+			fmt.Println("\n可用命令:")
+			fmt.Println("/list - 显示在线用户")
+			fmt.Println("/chat <用户名> - 开始与用户聊天")
+			fmt.Println("/sendfile <文件路径> - 在聊天中发送文件")
+			fmt.Println("/quit - 退出程序")
+			fmt.Println()
 			default:
 				fmt.Println("未知命令，输入 /help 查看帮助")
 			}
@@ -854,7 +913,445 @@ func getLocalIP() string {
 	return "127.0.0.1"
 }
 
+// 生成文件唯一ID
+func generateFileID() string {
+	return fmt.Sprintf("file_%d_%d", time.Now().UnixNano(), rand.Intn(10000))
+}
+
+// 发送文件
+func (c *ChatClient) sendFile(filePath string) {
+	// 检查是否正在传输文件
+	c.fileMutex.Lock()
+	if c.transmitting {
+		c.fileMutex.Unlock()
+		fmt.Println("正在传输其他文件，请稍后再试")
+		fmt.Print("你: ")
+		return
+	}
+	c.transmitting = true
+	c.fileMutex.Unlock()
+
+	// 检查文件是否存在
+	file, err := os.Open(filePath)
+	if err != nil {
+		c.fileMutex.Lock()
+		c.transmitting = false
+		c.fileMutex.Unlock()
+		fmt.Printf("无法访问文件: %v\n", err)
+		fmt.Print("你: ")
+		return
+	}
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		file.Close()
+		c.fileMutex.Lock()
+		c.transmitting = false
+		c.fileMutex.Unlock()
+		fmt.Printf("获取文件信息失败: %v\n", err)
+		fmt.Print("你: ")
+		return
+	}
+
+	// 检查是否为文件
+	if fileInfo.IsDir() {
+		file.Close()
+		c.fileMutex.Lock()
+		c.transmitting = false
+		c.fileMutex.Unlock()
+		fmt.Println("不能发送目录，请选择文件")
+		fmt.Print("你: ")
+		return
+	}
+
+	// 获取文件名和大小
+	fileName := fileInfo.Name()
+	fileSize := fileInfo.Size()
+
+	// 生成文件ID
+	fileID := generateFileID()
+
+	// 计算总块数（每块16KB）
+	const chunkSize = 16 * 1024
+	totalChunks := int((fileSize + chunkSize - 1) / chunkSize)
+
+	// 保存文件信息
+	transferFile := &TransferringFile{
+		FilePath:     filePath,
+		FileName:     fileName,
+		FileSize:     fileSize,
+		FileID:       fileID,
+		File:         file,
+		TotalChunks:  totalChunks,
+		CurrentChunk: 0,
+		Buffer:       make([]byte, chunkSize),
+	}
+
+	c.fileMutex.Lock()
+	c.sendingFiles[fileID] = transferFile
+	c.fileMutex.Unlock()
+
+	// 发送文件发送请求
+	fileOfferMsg := common.Message{
+		Type:        common.MsgTypeFileOffer,
+		From:        c.name,
+		FileName:    fileName,
+		FileSize:    fileSize,
+		FileID:      fileID,
+		TotalChunks: totalChunks,
+	}
+
+	data, _ := json.Marshal(fileOfferMsg)
+	_, err = c.chatConn.Write(append(data, '\n'))
+	if err != nil {
+		c.cleanupSendingFile(fileID)
+		fmt.Printf("发送文件请求失败: %v\n", err)
+		fmt.Print("你: ")
+		return
+	}
+
+	fmt.Printf("📤 发送文件请求: %s (%s)\n", fileName, formatFileSize(fileSize))
+	fmt.Println("等待对方接受...")
+
+	// 等待响应（在handleFileMessage中处理）
+	fmt.Print("你: ")
+}
+
+// 清理接收中的文件资源
+func (c *ChatClient) cleanupReceivingFile(fileID string) {
+	c.fileMutex.Lock()
+	defer c.fileMutex.Unlock()
+	
+	if file, exists := c.receivingFiles[fileID]; exists {
+		if file.File != nil {
+			file.File.Close()
+		}
+		delete(c.receivingFiles, fileID)
+	}
+	c.receiving = false
+}
+
+// 处理文件发送请求
+func (c *ChatClient) handleFileOffer(msg *common.Message, conn net.Conn) {
+	c.fileMutex.Lock()
+	if c.receiving {
+		c.fileMutex.Unlock()
+		// 发送拒绝消息
+		rejectMsg := common.Message{
+			Type:   common.MsgTypeFileReject,
+			From:   c.name,
+			FileID: msg.FileID,
+		}
+		data, _ := json.Marshal(rejectMsg)
+		conn.Write(append(data, '\n'))
+		return
+	}
+	c.receiving = true
+	c.fileMutex.Unlock()
+
+	// 显示文件信息并询问是否接受
+	fmt.Printf("\n📥 %s 向你发送文件:\n", msg.From)
+	fmt.Printf("文件名: %s\n", msg.FileName)
+	fmt.Printf("文件大小: %s\n", formatFileSize(msg.FileSize))
+	fmt.Print("是否接受文件？(y/n): ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+	response = strings.TrimSpace(response)
+
+	if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+		// 拒绝文件
+		rejectMsg := common.Message{
+			Type:   common.MsgTypeFileReject,
+			From:   c.name,
+			FileID: msg.FileID,
+		}
+		data, _ := json.Marshal(rejectMsg)
+		conn.Write(append(data, '\n'))
+		fmt.Println("文件传输已取消")
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+		c.fileMutex.Lock()
+		c.receiving = false
+		c.fileMutex.Unlock()
+		return
+	}
+
+	// 创建保存文件的完整路径
+	savePath := filepath.Join(c.fileDataDir, msg.FileName)
+	
+	// 检查文件是否已存在，如果存在则添加时间戳
+	if _, err := os.Stat(savePath); err == nil {
+		timestamp := time.Now().Format("20060102_150405")
+		ext := filepath.Ext(msg.FileName)
+		baseName := strings.TrimSuffix(msg.FileName, ext)
+		savePath = filepath.Join(c.fileDataDir, fmt.Sprintf("%s_%s%s", baseName, timestamp, ext))
+	}
+
+	// 创建文件用于保存
+	file, err := os.Create(savePath)
+	if err != nil {
+		fmt.Printf("创建文件失败: %v\n", err)
+		// 发送拒绝消息
+		rejectMsg := common.Message{
+			Type:   common.MsgTypeFileReject,
+			From:   c.name,
+			FileID: msg.FileID,
+		}
+		data, _ := json.Marshal(rejectMsg)
+		conn.Write(append(data, '\n'))
+		c.fileMutex.Lock()
+		c.receiving = false
+		c.fileMutex.Unlock()
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+		return
+	}
+
+	// 保存文件传输信息
+	transferFile := &TransferringFile{
+		FilePath:     savePath,
+		FileName:     msg.FileName,
+		FileSize:     msg.FileSize,
+		FileID:       msg.FileID,
+		File:         file,
+		TotalChunks:  msg.TotalChunks,
+		CurrentChunk: 0,
+	}
+
+	c.fileMutex.Lock()
+	c.receivingFiles[msg.FileID] = transferFile
+	c.fileMutex.Unlock()
+
+	// 接受文件
+	acceptMsg := common.Message{
+		Type:   common.MsgTypeFileAccept,
+		From:   c.name,
+		FileID: msg.FileID,
+	}
+	data, _ := json.Marshal(acceptMsg)
+	conn.Write(append(data, '\n'))
+
+	// 准备接收文件数据
+	fmt.Printf("开始接收文件: %s\n", msg.FileName)
+	fmt.Printf("保存路径: %s\n", savePath)
+
+	if c.inChatSession {
+		fmt.Print("你: ")
+	}
+}
+
+// 处理文件传输相关消息
+func (c *ChatClient) handleFileMessage(msg *common.Message, conn net.Conn) {
+	switch msg.Type {
+	case common.MsgTypeFileAccept:
+		// 对方接受了文件，开始发送文件数据
+		go c.sendFileData(msg.FileID)
+	case common.MsgTypeFileReject:
+		// 对方拒绝了文件
+		c.fileMutex.Lock()
+		c.transmitting = false
+		c.fileMutex.Unlock()
+		fmt.Printf("\n❌ %s 拒绝了你的文件\n", msg.From)
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+	case common.MsgTypeFileData:
+		// 接收文件数据
+		go c.receiveFileData(msg)
+	case common.MsgTypeFileDone:
+		// 文件传输完成
+		c.fileMutex.Lock()
+		c.receiving = false
+		c.fileMutex.Unlock()
+		fmt.Printf("\n✅ 文件 '%s' 接收完成，已保存到: %s\n", msg.FileName, c.fileDataDir)
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+	case common.MsgTypeFileCancel:
+		// 文件传输取消
+		c.fileMutex.Lock()
+		c.transmitting = false
+		c.receiving = false
+		c.fileMutex.Unlock()
+		fmt.Printf("\n❌ 文件传输已取消\n")
+		if c.inChatSession {
+			fmt.Print("你: ")
+		}
+	}
+}
+
+// 清理发送中的文件资源
+func (c *ChatClient) cleanupSendingFile(fileID string) {
+	c.fileMutex.Lock()
+	defer c.fileMutex.Unlock()
+	
+	if file, exists := c.sendingFiles[fileID]; exists {
+		if file.File != nil {
+			file.File.Close()
+		}
+		delete(c.sendingFiles, fileID)
+	}
+	c.transmitting = false
+}
+
+// 发送文件数据
+func (c *ChatClient) sendFileData(fileID string) {
+	c.fileMutex.Lock()
+	transferFile, exists := c.sendingFiles[fileID]
+	if !exists {
+		c.fileMutex.Unlock()
+		fmt.Println("找不到文件传输信息")
+		return
+	}
+	c.fileMutex.Unlock()
+
+	fmt.Printf("开始发送文件: %s\n", transferFile.FileName)
+	const chunkSize = 16 * 1024
+
+	for transferFile.CurrentChunk < transferFile.TotalChunks {
+		// 读取文件数据
+		n, err := transferFile.File.Read(transferFile.Buffer)
+		if err != nil && err.Error() != "EOF" {
+			fmt.Printf("读取文件失败: %v\n", err)
+			// 发送取消消息
+			cancelMsg := common.Message{
+				Type:   common.MsgTypeFileCancel,
+				From:   c.name,
+				FileID: fileID,
+			}
+			data, _ := json.Marshal(cancelMsg)
+			c.chatConn.Write(append(data, '\n'))
+			c.cleanupSendingFile(fileID)
+			return
+		}
+
+		if n == 0 {
+			break
+		}
+
+		// 编码文件数据为base64
+		fileData := string(transferFile.Buffer[:n])
+
+		// 计算进度
+		progress := int(float64(transferFile.CurrentChunk+1) / float64(transferFile.TotalChunks) * 100)
+
+		// 发送数据块
+		dataMsg := common.Message{
+			Type:        common.MsgTypeFileData,
+			From:        c.name,
+			FileID:      fileID,
+			FileData:    fileData,
+			ChunkIndex:  transferFile.CurrentChunk,
+			TotalChunks: transferFile.TotalChunks,
+			Progress:    progress,
+		}
+
+		data, _ := json.Marshal(dataMsg)
+		_, err = c.chatConn.Write(append(data, '\n'))
+		if err != nil {
+			fmt.Printf("发送文件数据失败: %v\n", err)
+			c.cleanupSendingFile(fileID)
+			return
+		}
+
+		// 显示进度
+		fmt.Printf("发送进度: %d%% (块 %d/%d)\r", progress, transferFile.CurrentChunk+1, transferFile.TotalChunks)
+
+		transferFile.CurrentChunk++
+
+		// 小延迟避免网络拥塞
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 发送完成消息
+	doneMsg := common.Message{
+		Type:     common.MsgTypeFileDone,
+		From:     c.name,
+		FileID:   fileID,
+		FileName: transferFile.FileName,
+	}
+	data, _ := json.Marshal(doneMsg)
+	c.chatConn.Write(append(data, '\n'))
+
+	fmt.Printf("\n✅ 文件 '%s' 发送完成\n", transferFile.FileName)
+	c.cleanupSendingFile(fileID)
+}
+
+// 接收文件数据
+func (c *ChatClient) receiveFileData(msg *common.Message) {
+	c.fileMutex.Lock()
+	transferFile, exists := c.receivingFiles[msg.FileID]
+	if !exists {
+		c.fileMutex.Unlock()
+		fmt.Printf("找不到接收文件信息: %s\n", msg.FileID)
+		return
+	}
+	c.fileMutex.Unlock()
+
+	// 检查数据块索引是否正确
+	if msg.ChunkIndex != transferFile.CurrentChunk {
+		fmt.Printf("数据块顺序错误，期望: %d, 收到: %d\n", transferFile.CurrentChunk, msg.ChunkIndex)
+		// 可以选择请求重新发送该块
+		return
+	}
+
+	// 写入文件数据
+	data := []byte(msg.FileData)
+	_, err := transferFile.File.Write(data)
+	if err != nil {
+		fmt.Printf("写入文件失败: %v\n", err)
+		// 发送取消消息
+		cancelMsg := common.Message{
+			Type:   common.MsgTypeFileCancel,
+			From:   c.name,
+			FileID: msg.FileID,
+		}
+		data, _ := json.Marshal(cancelMsg)
+		c.chatConn.Write(append(data, '\n'))
+		c.cleanupReceivingFile(msg.FileID)
+		return
+	}
+
+	// 更新当前块索引
+	transferFile.CurrentChunk++
+
+	// 显示进度
+	fmt.Printf("接收进度: %d%% (块 %d/%d)\r", msg.Progress, transferFile.CurrentChunk, transferFile.TotalChunks)
+
+	// 如果所有数据块都已接收，不需要做特殊处理，因为发送方会发送FileDone消息
+}
+
+// 格式化文件大小
+func formatFileSize(size int64) string {
+	const (
+		_ = iota
+		KB int64 = 1 << (10 * iota)
+		MB
+		GB
+		TB
+	)
+
+	switch {
+	case size >= TB:
+		return fmt.Sprintf("%.2f TB", float64(size)/float64(TB))
+	case size >= GB:
+		return fmt.Sprintf("%.2f GB", float64(size)/float64(GB))
+	case size >= MB:
+		return fmt.Sprintf("%.2f MB", float64(size)/float64(MB))
+	case size >= KB:
+		return fmt.Sprintf("%.2f KB", float64(size)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", size)
+	}
+}
+
 func main() {
+	// 初始化随机数种子
+	rand.Seed(time.Now().UnixNano())
+	
 	fmt.Println("=== Go聊天客户端 ===")
 	fmt.Println("正在启动...")
 
