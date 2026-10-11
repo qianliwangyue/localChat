@@ -1,6 +1,6 @@
 # 运行方法
 
-##### (仓库中提供了windows版本的程序压缩包[boom.zip解压后的boom.exe可直接使用])
+##### (仓库中提供了windows版本的程序压缩包[localchat.zip解压后的localchat.exe可直接使用])
 
 ## 编译方法
 ##### 先clone仓库
