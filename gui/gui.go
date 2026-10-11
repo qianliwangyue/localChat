@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"localchat/gui/theme"
 	"localchat/pkg/common"
 	"localchat/types"
 
@@ -64,6 +65,7 @@ func (ui *ChatUI) uiDo(f func()) {
 // Run 启动图形界面应用
 func Run() {
 	a := app.New()
+	a.Settings().SetTheme(&theme.MyTheme{})
 	w := a.NewWindow("LocalChat - 局域网聊天与文件传输")
 	w.Resize(fyne.NewSize(960, 640))
 	w.SetMaster()
