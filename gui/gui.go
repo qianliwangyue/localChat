@@ -25,10 +25,11 @@ type ChatUI struct {
 
 	peers []common.Peer // 在线用户快照
 
-	peerList  *widget.List
-	chatLog   *widget.Entry
-	msgInput  *widget.Entry
-	chatTitle *widget.Label
+	peerList   *widget.List
+	chatLog    *widget.Label
+	chatScroll *container.Scroll
+	msgInput   *widget.Entry
+	chatTitle  *widget.Label
 
 	sendFileBtn   *widget.Button
 	sendFolderBtn *widget.Button
@@ -162,10 +163,14 @@ func (ui *ChatUI) bindCallbacks() {
 		})
 	}
 
-	c.OnFileOffer = func(from, fileName string, size int64, fileID string) {
+	c.OnFileOffer = func(from, fromAddr, fileName string, size int64, fileID string) {
 		ui.uiDo(func() {
+			sender := from
+			if fromAddr != "" {
+				sender = fmt.Sprintf("%s (%s)", from, fromAddr)
+			}
 			dialog.ShowConfirm("收到文件请求",
-				fmt.Sprintf("%s 向你发送文件：\n\n%s (%s)\n\n是否接受？", from, fileName, types.FormatFileSize(size)),
+				fmt.Sprintf("%s 向你发送文件：\n\n%s (%s)\n\n是否接受？", sender, fileName, types.FormatFileSize(size)),
 				func(ok bool) {
 					if ok {
 						go ui.client.AcceptFile(fileID)
@@ -176,10 +181,14 @@ func (ui *ChatUI) bindCallbacks() {
 		})
 	}
 
-	c.OnFolderOffer = func(from, folderName string, size int64, fileCount int, folderID string) {
+	c.OnFolderOffer = func(from, fromAddr, folderName string, size int64, fileCount int, folderID string) {
 		ui.uiDo(func() {
+			sender := from
+			if fromAddr != "" {
+				sender = fmt.Sprintf("%s (%s)", from, fromAddr)
+			}
 			dialog.ShowConfirm("收到文件夹请求",
-				fmt.Sprintf("%s 向你发送文件夹：\n\n%s (%s, %d 个文件)\n\n是否接受？", from, folderName, types.FormatFileSize(size), fileCount),
+				fmt.Sprintf("%s 向你发送文件夹：\n\n%s (%s, %d 个文件)\n\n是否接受？", sender, folderName, types.FormatFileSize(size), fileCount),
 				func(ok bool) {
 					if ok {
 						go ui.client.AcceptFolder(folderID)
@@ -248,9 +257,11 @@ func (ui *ChatUI) showMainUI() {
 	// 右侧：聊天区
 	ui.chatTitle = widget.NewLabelWithStyle("未在聊天中 - 点击左侧用户开始聊天", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
 
-	ui.chatLog = widget.NewMultiLineEntry()
+	// 聊天记录使用Label而非禁用的Entry：Entry被Disable后文字渲染成低对比度灰色，
+	// 系统通知和聊天内容都看不清；Label使用正常前景色且天然只读
+	ui.chatLog = widget.NewLabel("")
 	ui.chatLog.Wrapping = fyne.TextWrapBreak
-	ui.chatLog.Disable()
+	ui.chatScroll = container.NewScroll(ui.chatLog)
 
 	ui.msgInput = widget.NewEntry()
 	ui.msgInput.SetPlaceHolder("输入消息，回车发送...")
@@ -273,7 +284,7 @@ func (ui *ChatUI) showMainUI() {
 			container.NewHBox(ui.sendFileBtn, ui.sendFolderBtn, layout.NewSpacer(), ui.endChatBtn),
 		),
 		nil, nil,
-		container.NewScroll(ui.chatLog),
+		ui.chatScroll,
 	)
 
 	split := container.NewHSplit(peersPanel, chatPanel)
@@ -295,9 +306,10 @@ func (ui *ChatUI) showMainUI() {
 	ui.ready = true
 }
 
-// appendLog 向聊天日志追加一行
+// appendLog 向聊天日志追加一行，并自动滚动到底部保证新消息可见
 func (ui *ChatUI) appendLog(text string) {
 	ui.chatLog.SetText(ui.chatLog.Text + text + "\n")
+	ui.chatScroll.ScrollToBottom()
 }
 
 // setChatControls 启用/禁用聊天相关控件
@@ -329,27 +341,29 @@ func (ui *ChatUI) sendMsg() {
 	ui.msgInput.SetText("")
 }
 
-// tryStartChat 点击用户列表项，开始或切换聊天
+// tryStartChat 点击用户列表项，开始或切换聊天。
+// 按IP:端口定位用户，代号相同的不同用户也能精确发起聊天
 func (ui *ChatUI) tryStartChat(p common.Peer) {
 	ui.peerList.UnselectAll()
 
 	if ui.client.IsInChat() {
-		current := ui.client.GetCurrentChat()
-		if current == p.Name {
+		// 点击的正是当前聊天对象（按端点判断，同名用户不误判）
+		if ui.client.IsCurrentChatPeer(p.IP, p.Port) {
 			return
 		}
+		current := ui.client.GetCurrentChat()
 		dialog.ShowConfirm("切换聊天",
-			fmt.Sprintf("当前正在与 %s 聊天，是否结束并切换到 %s？", current, p.Name),
+			fmt.Sprintf("当前正在与 %s 聊天，是否结束并切换到 %s（%s:%d）？", current, p.Name, p.IP, p.Port),
 			func(ok bool) {
 				if ok {
 					ui.client.EndChat()
-					go ui.client.StartChat(p.Name)
+					go ui.client.StartChatWith(p.IP, p.Port)
 				}
 			}, ui.win)
 		return
 	}
 
-	go ui.client.StartChat(p.Name)
+	go ui.client.StartChatWith(p.IP, p.Port)
 }
 
 // pickFile 选择并发送文件

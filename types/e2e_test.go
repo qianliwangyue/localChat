@@ -97,12 +97,12 @@ func TestE2E(t *testing.T) {
 	b.OnFileProgress = func(pct int, sending bool, label string) { t.Logf("[B进度] %d%% %s", pct, label) }
 	b.OnTransferEnded = func(sending bool, text string) { t.Logf("[B传输结束] %v %s", sending, text) }
 	// 收到文件请求自动接受
-	b.OnFileOffer = func(from, fileName string, size int64, fileID string) {
+	b.OnFileOffer = func(from, fromAddr, fileName string, size int64, fileID string) {
 		t.Logf("[B] 收到文件请求 %s (%d字节)，自动接受", fileName, size)
 		go b.AcceptFile(fileID)
 	}
 	// 收到文件夹请求自动接受
-	b.OnFolderOffer = func(from, folderName string, size int64, fileCount int, folderID string) {
+	b.OnFolderOffer = func(from, fromAddr, folderName string, size int64, fileCount int, folderID string) {
 		t.Logf("[B] 收到文件夹请求 %s (%d个文件)，自动接受", folderName, fileCount)
 		go b.AcceptFolder(folderID)
 	}

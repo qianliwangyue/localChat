@@ -30,13 +30,16 @@ func waitCond(t *testing.T, timeout time.Duration, cond func() bool, msg string,
 	t.Fatalf("超时等待: %s", msg)
 }
 
-// newTestUI 使用Fyne测试驱动器创建真实的ChatUI实例
-func newTestUI(t *testing.T, name string) *ChatUI {
+// newTestUI 使用Fyne测试驱动器创建真实的ChatUI实例。
+// portBase指定UDP/TCP端口段，不同测试使用不重叠段，避免Windows UDP
+// SO_REUSEADDR下刚关闭的socket吸走新实例广播包导致的串扰
+func newTestUI(t *testing.T, name string, portBase int) *ChatUI {
 	ui := &ChatUI{win: test.NewWindow(nil)}
 	ui.win.Resize(fyne.NewSize(960, 640))
 
 	client := types.NewChatClient()
 	client.SetName(name)
+	client.SetPortBase(portBase)
 	ui.client = client
 	ui.bindCallbacks()
 	client.Start()
@@ -52,19 +55,19 @@ func TestGUITransferFlow(t *testing.T) {
 	os.RemoveAll("received_files")
 	defer os.RemoveAll("received_files")
 
-	uiA := newTestUI(t, "GuiA")
-	uiB := newTestUI(t, "GuiB")
+	uiA := newTestUI(t, "GuiA", 4000)
+	uiB := newTestUI(t, "GuiB", 4000)
 	defer func() {
 		uiA.client.Stop()
 		uiB.client.Stop()
 	}()
 
 	// B端自动接受文件/文件夹请求（模拟用户点击"是"对话框）
-	uiB.client.OnFileOffer = func(from, fileName string, size int64, fileID string) {
+	uiB.client.OnFileOffer = func(from, fromAddr, fileName string, size int64, fileID string) {
 		t.Logf("[B] 收到文件请求 %s(%d字节)，自动接受", fileName, size)
 		go uiB.client.AcceptFile(fileID)
 	}
-	uiB.client.OnFolderOffer = func(from, folderName string, size int64, fileCount int, folderID string) {
+	uiB.client.OnFolderOffer = func(from, fromAddr, folderName string, size int64, fileCount int, folderID string) {
 		t.Logf("[B] 收到文件夹请求 %s(%d个文件)，自动接受", folderName, fileCount)
 		go uiB.client.AcceptFolder(folderID)
 	}
@@ -164,7 +167,7 @@ func TestGUITransferFlow(t *testing.T) {
 
 	// ===== 5. 拒绝文件后能继续发送（验证清理逻辑） =====
 	rejected := false
-	uiB.client.OnFileOffer = func(from, fileName string, size int64, fileID string) {
+	uiB.client.OnFileOffer = func(from, fromAddr, fileName string, size int64, fileID string) {
 		t.Logf("[B] 收到文件请求 %s，自动拒绝", fileName)
 		rejected = true
 		go uiB.client.RejectFile(fileID)
@@ -183,7 +186,7 @@ func TestGUITransferFlow(t *testing.T) {
 	t.Log("拒绝流程通过：资源已清理")
 
 	// ===== 6. 拒绝后再次发送应成功 =====
-	uiB.client.OnFileOffer = func(from, fileName string, size int64, fileID string) {
+	uiB.client.OnFileOffer = func(from, fromAddr, fileName string, size int64, fileID string) {
 		t.Logf("[B] 收到文件请求 %s，自动接受", fileName)
 		go uiB.client.AcceptFile(fileID)
 	}
@@ -224,8 +227,8 @@ func TestGUIPeerListRefreshDuringChat(t *testing.T) {
 	os.RemoveAll("received_files")
 	defer os.RemoveAll("received_files")
 
-	uiA := newTestUI(t, "ListA")
-	uiB := newTestUI(t, "ListB")
+	uiA := newTestUI(t, "ListA", 5000)
+	uiB := newTestUI(t, "ListB", 5000)
 	defer func() {
 		uiA.client.Stop()
 		uiB.client.Stop()
@@ -256,7 +259,7 @@ func TestGUIPeerListRefreshDuringChat(t *testing.T) {
 	}
 
 	// C在A、B聊天期间上线
-	uiC := newTestUI(t, "ListC")
+	uiC := newTestUI(t, "ListC", 5000)
 	defer uiC.client.Stop()
 
 	// A、B的列表必须在聊天中也出现C

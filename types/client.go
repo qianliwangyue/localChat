@@ -38,11 +38,15 @@ type ChatClient struct {
 	online         atomic.Bool
 	localIP        string
 	inChatSession  bool
-	currentChat    string // 当前聊天对象
+	currentChat    string // 当前聊天对象代号（仅用于显示）
+	currentChatKey string // 当前聊天对象唯一身份 "IP:TCP端口"，代号相同的不同用户以此区分
 	chatConn       net.Conn
-	chatMutex      sync.Mutex
+	chatMutex      sync.RWMutex
 	lastPeersHash  string          // 上次在线用户列表的哈希值
 	announcedPeers map[string]bool // 已经公告过的用户
+	peerTimeout    time.Duration   // 超过该时长无任何存活消息则判定离线
+	reapInterval   time.Duration   // 离线收割扫描间隔
+	portBase       int             // UDP/TCP端口段偏移（生产为0；测试用不同段隔离SO_REUSEADDR残留抢包）
 	// 文件传输相关字段
 	fileMutex    sync.Mutex
 	transmitting bool
@@ -56,16 +60,16 @@ type ChatClient struct {
 	receivingFolders map[string]*TransferringFolder // folderID -> 文件夹信息
 
 	// 事件回调（供GUI使用，均为可选，需在Start之前设置）
-	OnLog           func(text string)                                                         // 系统日志/提示信息
-	OnPeersChanged  func(peers []common.Peer)                                                 // 在线用户列表变化
-	OnChatStarted   func(peerName string)                                                     // 聊天会话开始
-	OnChatMessage   func(from, content string)                                                // 收到聊天消息
-	OnChatEnded     func()                                                                    // 聊天会话结束
-	OnFileOffer     func(from, fileName string, size int64, fileID string)                    // 收到文件请求
-	OnFolderOffer   func(from, folderName string, size int64, fileCount int, folderID string) // 收到文件夹请求
-	OnFileProgress  func(pct int, sending bool, label string)                                 // 传输进度
-	OnTransferEnded func(sending bool, text string)                                           // 传输结束（完成/拒绝/取消）
-	OnFileSaved     func(fileName, savePath string)                                           // 单文件接收完成（含保存路径）
+	OnLog           func(text string)                                                                   // 系统日志/提示信息
+	OnPeersChanged  func(peers []common.Peer)                                                           // 在线用户列表变化
+	OnChatStarted   func(peerName string)                                                               // 聊天会话开始
+	OnChatMessage   func(from, content string)                                                          // 收到聊天消息
+	OnChatEnded     func()                                                                              // 聊天会话结束
+	OnFileOffer     func(from, fromAddr, fileName string, size int64, fileID string)                    // 收到文件请求（fromAddr为发送者IP，用于同名用户区分）
+	OnFolderOffer   func(from, fromAddr, folderName string, size int64, fileCount int, folderID string) // 收到文件夹请求
+	OnFileProgress  func(pct int, sending bool, label string)                                           // 传输进度
+	OnTransferEnded func(sending bool, text string)                                                     // 传输结束（完成/拒绝/取消）
+	OnFileSaved     func(fileName, savePath string)                                                     // 单文件接收完成（含保存路径）
 
 	// 待用户确认的传输请求
 	pendingFileOffers   map[string]*fileOfferRequest // fileID -> 请求
@@ -83,6 +87,8 @@ func NewChatClient() *ChatClient {
 		peers:               make(map[string]*common.Peer),
 		localIP:             getLocalIP(),
 		announcedPeers:      make(map[string]bool),
+		peerTimeout:         60 * time.Second,
+		reapInterval:        10 * time.Second,
 		fileDataDir:         dataDir,
 		transmitting:        false,
 		receiving:           false,
@@ -95,6 +101,53 @@ func NewChatClient() *ChatClient {
 	}
 	client.online.Store(true)
 	return client
+}
+
+// peerKeyOf 生成用户唯一身份键（IP:TCP端口）。代号可以重复，网络端点才是唯一身份
+func peerKeyOf(ip string, port int) string {
+	return fmt.Sprintf("%s:%d", ip, port)
+}
+
+// isSelfPeer 判断给定端点是否就是本机客户端自己（含回环地址与本机网卡IP）
+func (c *ChatClient) isSelfPeer(ip string, port int) bool {
+	return port == c.tcpPort && isLocalAddress(ip, c.localIP)
+}
+
+// remoteIP 安全获取TCP连接对端IP
+func remoteIP(conn net.Conn) string {
+	if conn == nil {
+		return ""
+	}
+	if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		return addr.IP.String()
+	}
+	return conn.RemoteAddr().String()
+}
+
+// isLocalAddress 判断IP是否指向本机（回环或本机网卡IP）
+func isLocalAddress(ip, localIP string) bool {
+	if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
+		return true
+	}
+	return ip == localIP
+}
+
+// connTargetsSelf 判断已建立的TCP连接对端是否就是本机自己的监听端口（TCP自连）。
+// TCP允许connect到自身监听的端口，会形成自发自收的回环连接，必须在握手阶段拦截。
+func (c *ChatClient) connTargetsSelf(conn net.Conn) bool {
+	addr, ok := conn.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	// 对端端口必须与本机TCP监听端口一致；跨机器时IP不同也不构成自连
+	return addr.Port == c.tcpPort && isLocalAddress(addr.IP.String(), c.localIP)
+}
+
+// isCurrentChatPeer 判断给定端点是否为当前聊天对象（按端点而非代号判断）
+func (c *ChatClient) isCurrentChatPeer(ip string, port int) bool {
+	c.chatMutex.RLock()
+	defer c.chatMutex.RUnlock()
+	return c.inChatSession && c.currentChatKey == peerKeyOf(ip, port)
 }
 
 // logf 输出系统日志（GUI通过OnLog回调接收）
@@ -135,6 +188,9 @@ func (c *ChatClient) Start() {
 
 	c.logf("客户端启动成功! IP: %s, TCP端口: %d, UDP端口: %d", c.localIP, c.tcpPort, c.udpPort)
 
+	// 确保Windows防火墙放行入站连接（跨机聊天依赖对端连入；异步执行不阻塞启动）
+	go c.ensureFirewallRule()
+
 	// 广播上线通知
 	go c.broadcastOnline()
 
@@ -143,6 +199,9 @@ func (c *ChatClient) Start() {
 
 	// 定期发送发现消息
 	go c.periodicDiscover()
+
+	// 定期收割超时无响应的用户（崩溃/断网/Offline丢失的兜底）
+	go c.reapStalePeersLoop()
 }
 
 // SetName 设置用户名
@@ -152,6 +211,19 @@ func (c *ChatClient) SetName(name string) {
 	}
 }
 
+// SetPortBase 设置UDP/TCP监听端口段偏移（必须在Start之前调用）。
+// 生产使用默认0；测试通过互不重叠的端口段隔离，避免Windows下UDP SO_REUSEADDR
+// 导致刚关闭的socket随机吸走新实例广播包
+func (c *ChatClient) SetPortBase(base int) {
+	c.portBase = base
+}
+
+// udpPortStart 本段UDP端口范围起点
+func (c *ChatClient) udpPortStart() int { return common.BroadcastPort + c.portBase }
+
+// tcpPortStart 本段TCP端口范围起点
+func (c *ChatClient) tcpPortStart() int { return common.TCPPortStart + c.portBase }
+
 // GetName 获取用户名
 func (c *ChatClient) GetName() string {
 	return c.name
@@ -159,8 +231,9 @@ func (c *ChatClient) GetName() string {
 
 // 启动UDP广播监听
 func (c *ChatClient) startUDPListener() error {
-	// 尝试绑定可用的UDP端口
-	for port := common.BroadcastPort; port < common.BroadcastPort+100; port++ {
+	// 尝试绑定本段内可用的UDP端口
+	start := c.udpPortStart()
+	for port := start; port < start+100; port++ {
 		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
 		if err != nil {
 			continue
@@ -174,7 +247,7 @@ func (c *ChatClient) startUDPListener() error {
 			return nil
 		}
 	}
-	return fmt.Errorf("无法绑定UDP端口范围 %d-%d", common.BroadcastPort, common.BroadcastPort+100)
+	return fmt.Errorf("无法绑定UDP端口范围 %d-%d", start, start+100)
 }
 
 // 处理UDP消息
@@ -214,16 +287,18 @@ func (c *ChatClient) handleUDPMessages() {
 			continue
 		}
 
-		c.handleUDPMessage(&msg, srcAddr.IP.String())
+		c.handleUDPMessage(&msg, srcAddr.IP.String(), srcAddr.Port)
 	}
 }
 
 // 处理UDP消息
-func (c *ChatClient) handleUDPMessage(msg *common.Message, srcIP string) {
+func (c *ChatClient) handleUDPMessage(msg *common.Message, srcIP string, srcUDPPort int) {
 	switch msg.Type {
 	case common.MsgTypeDiscover:
-		// 响应发现请求 - 立即回复在线通知
-		c.sendUDPResponse(srcIP)
+		// Discover本身就是存活证据：刷新已知用户的最后可见时间
+		c.touchPeer(srcIP, msg.Port)
+		// 响应发现请求 - 直接回复发送者的UDP来源端口（不能写死9999，同机实例端口不同）
+		c.sendUDPResponse(srcIP, srcUDPPort)
 	case common.MsgTypeOnline:
 		// 处理上线通知
 		peer := &common.Peer{
@@ -233,8 +308,11 @@ func (c *ChatClient) handleUDPMessage(msg *common.Message, srcIP string) {
 		}
 		changed, isNew := c.addPeer(peer)
 		if isNew {
+			c.chatMutex.RLock()
+			inChat := c.inChatSession
+			c.chatMutex.RUnlock()
 			// 只有新用户才公告上线（聊天中不打断会话，仅静默刷新列表）
-			if !c.inChatSession {
+			if !inChat {
 				c.logf("[系统] %s 上线了!", msg.From)
 			}
 			// 发现新用户时，再次广播自己的上线通知（无论是否正在聊天）
@@ -245,13 +323,17 @@ func (c *ChatClient) handleUDPMessage(msg *common.Message, srcIP string) {
 			c.printOnlinePeers()
 		}
 	case common.MsgTypeOffline:
-		// 处理下线通知
+		// 处理下线通知（按端点识别，避免同名用户下线误伤当前会话）
+		isChatPeer := c.isCurrentChatPeer(srcIP, msg.Port)
 		changed := c.removePeerByIPAndPort(srcIP, msg.Port)
+		c.chatMutex.RLock()
+		inChat := c.inChatSession
+		c.chatMutex.RUnlock()
 		// 下线的是当前聊天对象：结束会话
-		if c.inChatSession && msg.From == c.currentChat {
+		if isChatPeer {
 			c.logf("%s 已下线，聊天自动结束", msg.From)
 			c.endChatSession()
-		} else if changed && !c.inChatSession {
+		} else if changed && !inChat {
 			c.logf("[系统] %s 下线了", msg.From)
 		}
 		if changed {
@@ -262,7 +344,7 @@ func (c *ChatClient) handleUDPMessage(msg *common.Message, srcIP string) {
 }
 
 // 发送UDP响应
-func (c *ChatClient) sendUDPResponse(destIP string) {
+func (c *ChatClient) sendUDPResponse(destIP string, destPort int) {
 	msg := common.Message{
 		Type:    common.MsgTypeOnline,
 		From:    c.name,
@@ -272,16 +354,17 @@ func (c *ChatClient) sendUDPResponse(destIP string) {
 	}
 
 	data, _ := msg.Serialize()
-	destAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", destIP, common.BroadcastPort))
-	if c.udpConn != nil {
+	destAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", destIP, destPort))
+	if c.udpConn != nil && destAddr != nil {
 		c.udpConn.WriteToUDP(data, destAddr)
 	}
 }
 
 // 启动TCP监听
 func (c *ChatClient) startTCPListener() error {
-	// 尝试绑定可用的TCP端口
-	for port := common.TCPPortStart; port < common.TCPPortStart+100; port++ {
+	// 尝试绑定本段内可用的TCP端口
+	start := c.tcpPortStart()
+	for port := start; port < start+100; port++ {
 		// 使用 0.0.0.0 绑定所有接口
 		listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 		if err == nil {
@@ -291,7 +374,7 @@ func (c *ChatClient) startTCPListener() error {
 			return nil
 		}
 	}
-	return fmt.Errorf("无法绑定TCP端口范围 %d-%d", common.TCPPortStart, common.TCPPortStart+100)
+	return fmt.Errorf("无法绑定TCP端口范围 %d-%d", start, start+100)
 }
 
 // 接受TCP连接
@@ -322,7 +405,10 @@ func (c *ChatClient) handleIncomingConnection(conn net.Conn) {
 		message, err := reader.ReadString('\n')
 		if err != nil {
 			// 连接断开，只有在聊天会话中才提示
-			if c.inChatSession && c.chatConn == conn {
+			c.chatMutex.RLock()
+			owned := c.inChatSession && c.chatConn == conn
+			c.chatMutex.RUnlock()
+			if owned {
 				c.logf("连接断开，聊天结束")
 				c.endChatSession()
 			}
@@ -339,9 +425,20 @@ func (c *ChatClient) handleIncomingConnection(conn net.Conn) {
 			continue
 		}
 
+		// 深度防御：拒绝TCP自连。聊天握手消息携带发送方TCP监听端口，
+		// 来源为本机且端口与本机监听口相同，说明有人（或错误的fallback）连到了自己
+		if msg.Type == common.MsgTypeChat && msg.Port == c.tcpPort &&
+			isLocalAddress(remoteAddr.IP.String(), c.localIP) {
+			c.logf("拒绝来自本机自身的聊天连接（不能与自己聊天）")
+			return
+		}
+
 		switch msg.Type {
 		case common.MsgTypeChat:
-			if c.inChatSession {
+			c.chatMutex.RLock()
+			inChat := c.inChatSession
+			c.chatMutex.RUnlock()
+			if inChat {
 				// 已经在聊天会话中，直接显示消息
 				if msg.Content == "/quit" {
 					c.logf("%s 结束了聊天", msg.From)
@@ -357,6 +454,8 @@ func (c *ChatClient) handleIncomingConnection(conn net.Conn) {
 				c.chatMutex.Lock()
 				c.chatConn = conn
 				c.currentChat = msg.From
+				// 用对端TCP监听端点作为唯一身份（初始消息携带Port），同名用户也能区分
+				c.currentChatKey = peerKeyOf(remoteAddr.IP.String(), msg.Port)
 				c.inChatSession = true
 				c.chatMutex.Unlock()
 
@@ -391,24 +490,31 @@ func (c *ChatClient) handleIncomingConnection(conn net.Conn) {
 	}
 }
 
-// 开始聊天会话
+// 开始聊天会话（按代号查找；同名时排除自己的端点，取第一个匹配项。
+// 需要精确定位同名用户时应使用 StartChatWith）
 func (c *ChatClient) startChatSession(targetName string) bool {
 	c.peersMutex.RLock()
-	defer c.peersMutex.RUnlock()
-
-	var targetPeer *common.Peer
+	var target *common.Peer
 	for _, peer := range c.peers {
-		if peer.Name == targetName {
-			targetPeer = peer
+		if peer.Name == targetName && !c.isSelfPeer(peer.IP, peer.Port) {
+			p := *peer
+			target = &p
 			break
 		}
 	}
+	c.peersMutex.RUnlock()
 
-	if targetPeer == nil {
+	if target == nil {
 		c.logf("用户 %s 不在线或不存在", targetName)
 		c.emitPeersChanged()
 		return false
 	}
+	return c.connectToPeer(target)
+}
+
+// connectToPeer 连接指定端点的用户并建立聊天会话
+func (c *ChatClient) connectToPeer(targetPeer *common.Peer) bool {
+	targetName := targetPeer.Name
 
 	// 尝试多种连接方式
 	addresses := c.generateConnectionAddresses(targetPeer.IP, targetPeer.Port)
@@ -421,9 +527,20 @@ func (c *ChatClient) startChatSession(targetName string) bool {
 
 		conn, err = net.DialTimeout("tcp", address, 5*time.Second)
 		if err == nil {
-			break
+			// 防止TCP自连：对端实际指向本机自己的监听端口时立即断开，
+			// 绝不建立"自己跟自己聊天"的会话（即使错误的fallback地址也无法绕过）
+			if c.connTargetsSelf(conn) {
+				c.logf("连接尝试 %d/%d 指向本机自己的端口，已拒绝自连", i+1, len(addresses))
+				conn.Close()
+				conn = nil
+				err = fmt.Errorf("目标 %s 是本机自己，不能与自己聊天", address)
+			} else {
+				break
+			}
 		}
-		c.logf("连接尝试 %d/%d 失败: %v", i+1, len(addresses), err)
+		if err != nil {
+			c.logf("连接尝试 %d/%d 失败: %v", i+1, len(addresses), err)
+		}
 
 		if i < len(addresses)-1 {
 			time.Sleep(1 * time.Second)
@@ -431,10 +548,19 @@ func (c *ChatClient) startChatSession(targetName string) bool {
 	}
 
 	if err != nil {
-		c.logf("连接用户 %s 失败，已尝试所有地址（可能已下线、被防火墙拦截或网络异常）", targetName)
+		// 区分失败原因给出精准提示：
+		// - i/o timeout：对端主机在线但入站SYN被防火墙/安全软件DROP（对端UDP广播仍可达，
+		//   典型场景是对端防火墙规则的网络配置文件Public/Private与当前网络不匹配）
+		// - connection refused：对端主机可达但程序未监听该端口（已退出或端口被占满）
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			c.logf("连接用户 %s 失败：连接超时，对方(%s:%d)的防火墙很可能拦截了入站连接（可让对方以管理员身份运行一次本程序自动放行防火墙）",
+				targetName, targetPeer.IP, targetPeer.Port)
+		} else {
+			c.logf("连接用户 %s 失败: %v（对方可能已退出）", targetName, err)
+		}
 
-		// 从对等列表中移除，因为无法连接
-		c.removePeerByIPAndPort(targetPeer.IP, targetPeer.Port)
+		// 不从在线列表移除：UDP发现机制证明对方仍在线（超过peerTimeout无广播才会被收割），
+		// TCP连不上多为防火墙拦截，误删会导致对方下次广播时反复提示"上线了"刷屏、列表抖动
 		return false
 	}
 
@@ -443,6 +569,7 @@ func (c *ChatClient) startChatSession(targetName string) bool {
 	c.chatMutex.Lock()
 	c.chatConn = conn
 	c.currentChat = targetName
+	c.currentChatKey = peerKeyOf(targetPeer.IP, targetPeer.Port)
 	c.inChatSession = true
 	c.chatMutex.Unlock()
 
@@ -453,10 +580,11 @@ func (c *ChatClient) startChatSession(targetName string) bool {
 	// 启动消息接收goroutine
 	go c.receiveChatMessages(conn)
 
-	// 发送初始消息
+	// 发送初始消息（携带TCP端口，供对端建立唯一身份键，区分同名用户）
 	initMsg := common.Message{
 		Type:    common.MsgTypeChat,
 		From:    c.name,
+		Port:    c.tcpPort,
 		Content: "你好！",
 	}
 	data, _ := json.Marshal(initMsg)
@@ -476,13 +604,10 @@ func (c *ChatClient) generateConnectionAddresses(ip string, port int) []string {
 		fmt.Sprintf("%s:%d", ip, port), // 原始地址
 	}
 
-	// 如果是本地IP，尝试回环地址
-	if ip == c.localIP || isPrivateIP(ip) {
-		addresses = append(addresses, fmt.Sprintf("127.0.0.1:%d", port))
-	}
-
-	// 如果是IPv6本地地址，尝试IPv4回环
-	if strings.Contains(ip, ":") {
+	// 只有目标确实在本机（同机运行的另一个实例）时，才追加回环地址兜底。
+	// 绝不能对局域网内其他机器（192.168.x.x等私有IP）回退到127.0.0.1：
+	// 一旦对方连不上，fallback会连到本机同端口，若该端口正是自己的监听口就变成自己跟自己聊天。
+	if ip != "127.0.0.1" && isLocalAddress(ip, c.localIP) {
 		addresses = append(addresses, fmt.Sprintf("127.0.0.1:%d", port))
 	}
 
@@ -518,7 +643,10 @@ func (c *ChatClient) receiveChatMessages(conn net.Conn) {
 		message, err := reader.ReadString('\n')
 		if err != nil {
 			// 只有在聊天会话中才处理断开
-			if c.inChatSession && c.chatConn == conn {
+			c.chatMutex.RLock()
+			owned := c.inChatSession && c.chatConn == conn
+			c.chatMutex.RUnlock()
+			if owned {
 				c.logf("连接断开: %v", err)
 				c.endChatSession()
 			}
@@ -606,6 +734,7 @@ func (c *ChatClient) endChatSession() {
 
 		c.inChatSession = false
 		c.currentChat = ""
+		c.currentChatKey = ""
 		if c.chatConn != nil {
 			c.chatConn.Close()
 			c.chatConn = nil
@@ -679,6 +808,8 @@ func (c *ChatClient) addPeer(peer *common.Peer) (bool, bool) {
 
 	// 检查是否已存在
 	if existing, exists := c.peers[key]; exists {
+		// 收到Online即证明对方存活，刷新最后可见时间
+		existing.LastSeen = time.Now()
 		// 如果用户名相同，没有变化
 		if existing.Name == peer.Name {
 			return false, false
@@ -688,6 +819,7 @@ func (c *ChatClient) addPeer(peer *common.Peer) (bool, bool) {
 		return true, false
 	} else {
 		// 新用户
+		peer.LastSeen = time.Now()
 		c.peers[key] = peer
 
 		// 检查是否已经公告过这个用户
@@ -716,6 +848,16 @@ func (c *ChatClient) removePeerByIPAndPort(ip string, port int) bool {
 		return true
 	}
 	return false
+}
+
+// touchPeer 刷新已知用户的最后可见时间（收到该用户的Discover等存活消息时调用）
+func (c *ChatClient) touchPeer(ip string, port int) {
+	key := fmt.Sprintf("%s:%d", ip, port)
+	c.peersMutex.Lock()
+	defer c.peersMutex.Unlock()
+	if p, exists := c.peers[key]; exists {
+		p.LastSeen = time.Now()
+	}
 }
 
 // 打印在线用户（仅在发生变化时刷新）
@@ -786,6 +928,59 @@ func (c *ChatClient) periodicDiscover() {
 	}
 }
 
+// reapStalePeersLoop 定期移除超时无任何存活消息的用户。
+// 对端正常退出会立即收到Offline；该循环兜底处理崩溃、杀进程、断网或Offline丢包。
+func (c *ChatClient) reapStalePeersLoop() {
+	interval := c.reapInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	timeout := c.peerTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for c.online.Load() {
+		<-ticker.C
+		if !c.online.Load() {
+			return
+		}
+		c.reapStalePeers(timeout)
+	}
+}
+
+// reapStalePeers 移除最后可见时间超过timeout的用户，并通知GUI刷新列表
+func (c *ChatClient) reapStalePeers(timeout time.Duration) {
+	now := time.Now()
+
+	c.peersMutex.Lock()
+	var expired []common.Peer
+	for key, p := range c.peers {
+		if now.Sub(p.LastSeen) > timeout {
+			expired = append(expired, *p)
+			delete(c.announcedPeers, fmt.Sprintf("%s@%s:%d", p.Name, p.IP, p.Port))
+			delete(c.peers, key)
+		}
+	}
+	c.peersMutex.Unlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	for _, p := range expired {
+		c.logf("[系统] %s 已离线（长时间无响应）", p.Name)
+	}
+	// 注意：此处仅把超时用户移出在线列表，绝不因此自动结束聊天（不自动/quit）。
+	// UDP广播可能因WiFi切换、休眠唤醒、网卡抖动等短暂丢失，而TCP聊天连接仍然完好；
+	// 聊天会话只由以下真实事件结束：用户手动结束、对方显式/quit、对方正常退出的Offline、
+	// TCP连接实际断开（读取失败，含对方进程崩溃/断网）。
+	c.printOnlinePeers()
+}
+
 // 发送广播消息
 func (c *ChatClient) sendBroadcast(msg *common.Message) {
 	if c.udpConn == nil {
@@ -794,8 +989,9 @@ func (c *ChatClient) sendBroadcast(msg *common.Message) {
 
 	data, _ := msg.Serialize()
 
-	// 广播到所有可能的端口
-	for port := common.BroadcastPort; port < common.BroadcastPort+100; port++ {
+	// 广播到本段所有可能的端口
+	udpStart := c.udpPortStart()
+	for port := udpStart; port < udpStart+100; port++ {
 		addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("255.255.255.255:%d", port))
 		c.udpConn.WriteTo(data, addr)
 	}
@@ -805,7 +1001,7 @@ func (c *ChatClient) sendBroadcast(msg *common.Message) {
 		ipParts := strings.Split(c.localIP, ".")
 		if len(ipParts) == 4 {
 			broadcastIP := fmt.Sprintf("%s.%s.%s.255", ipParts[0], ipParts[1], ipParts[2])
-			for port := common.BroadcastPort; port < common.BroadcastPort+100; port++ {
+			for port := udpStart; port < udpStart+100; port++ {
 				addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", broadcastIP, port))
 				c.udpConn.WriteTo(data, addr)
 			}
@@ -818,13 +1014,39 @@ func (c *ChatClient) ListPeers() {
 	c.forcePrintOnlinePeers()
 }
 
-// StartChat 开始与指定用户聊天
+// StartChat 按代号开始聊天。代号允许与自己相同（同名不同机），
+// 查找时会自动排除本机端点；同名在线时取第一个，精确选择请用 StartChatWith。
 func (c *ChatClient) StartChat(targetName string) bool {
-	if targetName == c.name {
+	return c.startChatSession(targetName)
+}
+
+// StartChatWith 与指定IP:TCP端口的用户开始聊天（同名用户的精确发起入口）。
+// 只有端点与本机完全一致时才判定为"自己"。
+func (c *ChatClient) StartChatWith(ip string, port int) bool {
+	if c.isSelfPeer(ip, port) {
 		c.logf("不能与自己聊天")
 		return false
 	}
-	return c.startChatSession(targetName)
+
+	c.peersMutex.RLock()
+	var target *common.Peer
+	if p, ok := c.peers[peerKeyOf(ip, port)]; ok {
+		cp := *p
+		target = &cp
+	}
+	c.peersMutex.RUnlock()
+
+	if target == nil {
+		c.logf("用户 %s:%d 不在线或不存在", ip, port)
+		c.emitPeersChanged()
+		return false
+	}
+	return c.connectToPeer(target)
+}
+
+// IsCurrentChatPeer 判断指定端点是否为当前聊天对象（供GUI同名用户去重用）
+func (c *ChatClient) IsCurrentChatPeer(ip string, port int) bool {
+	return c.isCurrentChatPeer(ip, port)
 }
 
 // EndChat 结束当前聊天
@@ -834,17 +1056,24 @@ func (c *ChatClient) EndChat() {
 
 // IsInChat 检查是否在聊天会话中
 func (c *ChatClient) IsInChat() bool {
+	c.chatMutex.RLock()
+	defer c.chatMutex.RUnlock()
 	return c.inChatSession
 }
 
 // GetCurrentChat 获取当前聊天对象
 func (c *ChatClient) GetCurrentChat() string {
+	c.chatMutex.RLock()
+	defer c.chatMutex.RUnlock()
 	return c.currentChat
 }
 
 // SendFile 发送文件
 func (c *ChatClient) SendFile(filePath string) bool {
-	if !c.inChatSession {
+	c.chatMutex.RLock()
+	inChat := c.inChatSession
+	c.chatMutex.RUnlock()
+	if !inChat {
 		c.logf("请先开始一个聊天会话")
 		return false
 	}
@@ -855,7 +1084,10 @@ func (c *ChatClient) SendFile(filePath string) bool {
 
 // SendFolder 发送文件夹
 func (c *ChatClient) SendFolder(folderPath string) bool {
-	if !c.inChatSession {
+	c.chatMutex.RLock()
+	inChat := c.inChatSession
+	c.chatMutex.RUnlock()
+	if !inChat {
 		c.logf("请先开始一个聊天会话")
 		return false
 	}
@@ -1054,7 +1286,10 @@ func (c *ChatClient) sendFile(filePath string) {
 
 // SendMessage 发送聊天消息（GUI使用）
 func (c *ChatClient) SendMessage(content string) bool {
-	if !c.inChatSession {
+	c.chatMutex.RLock()
+	inChat := c.inChatSession
+	c.chatMutex.RUnlock()
+	if !inChat {
 		return false
 	}
 	return c.sendChatMessage(content)
@@ -1168,7 +1403,7 @@ func (c *ChatClient) handleFileOffer(msg *common.Message, conn net.Conn) {
 	c.fileMutex.Unlock()
 
 	if c.OnFileOffer != nil {
-		c.OnFileOffer(msg.From, msg.FileName, msg.FileSize, msg.FileID)
+		c.OnFileOffer(msg.From, remoteIP(conn), msg.FileName, msg.FileSize, msg.FileID)
 	}
 }
 
@@ -1374,7 +1609,10 @@ func scanFolder(folderPath string) ([]string, int64, error) {
 
 // 发送文件夹
 func (c *ChatClient) sendFolder(folderPath string) {
-	if !c.inChatSession {
+	c.chatMutex.RLock()
+	inChat := c.inChatSession
+	c.chatMutex.RUnlock()
+	if !inChat {
 		c.logf("请先开始一个聊天会话")
 		return
 	}
@@ -1570,7 +1808,7 @@ func (c *ChatClient) handleFolderOffer(msg *common.Message, conn net.Conn) {
 	c.fileMutex.Unlock()
 
 	if c.OnFolderOffer != nil {
-		c.OnFolderOffer(msg.From, msg.FolderName, msg.FolderSize, msg.FileCount, msg.FolderID)
+		c.OnFolderOffer(msg.From, remoteIP(conn), msg.FolderName, msg.FolderSize, msg.FileCount, msg.FolderID)
 	}
 }
 

@@ -2,6 +2,7 @@ package common
 
 import (
 	"encoding/json"
+	"time"
 )
 
 const (
@@ -55,6 +56,10 @@ type Peer struct {
 	Name string `json:"name"` // 用户代号
 	IP   string `json:"ip"`   // IP地址
 	Port int    `json:"port"` // TCP端口
+
+	// LastSeen 最后一次收到该用户存活消息（Online/Discover）的时间，
+	// 用于崩溃/断网等无法发送Offline通知时的超时离线判定；不参与网络传输
+	LastSeen time.Time `json:"-"`
 }
 
 // 序列化消息
