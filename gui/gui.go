@@ -6,15 +6,17 @@ import (
 	"strings"
 	"sync"
 
-	"localchat/gui/theme"
+	apptheme "localchat/gui/theme"
 	"localchat/pkg/common"
 	"localchat/types"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -34,6 +36,11 @@ type ChatUI struct {
 	sendFileBtn   *widget.Button
 	sendFolderBtn *widget.Button
 	endChatBtn    *widget.Button
+
+	peerCount  *widget.Label    // 在线人数
+	emptyHint  *widget.Label    // 用户列表为空时的占位提示
+	statusDot  *canvas.Circle   // 聊天标题旁的状态点
+	headerInfo *widget.RichText // 顶部栏本机信息（小字）
 
 	// 传输进度对话框
 	progressDlg   *dialog.ProgressDialog
@@ -63,12 +70,49 @@ func (ui *ChatUI) uiDo(f func()) {
 	})
 }
 
+// maxWidthLayout 让子控件保持自身最小高度、但宽度固定为 w，并水平居中。
+// 用于欢迎页等内容列在窗口中的居中排版。
+type maxWidthLayout struct{ w float32 }
+
+func (m *maxWidthLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range objs {
+		min := o.MinSize()
+		h := min.Height
+		if h < size.Height {
+			h = size.Height
+		}
+		o.Resize(fyne.NewSize(m.w, h))
+		o.Move(fyne.NewPos((size.Width-m.w)/2, 0))
+	}
+}
+
+func (m *maxWidthLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	h := float32(0)
+	for _, o := range objs {
+		if mh := o.MinSize().Height; mh > h {
+			h = mh
+		}
+	}
+	return fyne.NewSize(m.w, h)
+}
+
+// brandLogo 生成品牌圆形图标（主题色圆底 + 居中的设备图标）
+func brandLogo(size float32) fyne.CanvasObject {
+	s := fyne.CurrentApp().Settings()
+	c := s.Theme().Color(theme.ColorNamePrimary, s.ThemeVariant())
+	bg := canvas.NewCircle(c)
+	icon := widget.NewIcon(theme.NewColoredResource(theme.ComputerIcon(), theme.ColorNameForegroundOnPrimary))
+	// MaxLayout 让圆底铺满整个格子，图标用 CenterLayout 保持原尺寸居中
+	logo := container.New(layout.NewMaxLayout(), bg, container.New(layout.NewCenterLayout(), icon))
+	return container.NewGridWrap(fyne.NewSize(size, size), logo)
+}
+
 // Run 启动图形界面应用
 func Run() {
 	a := app.New()
-	a.Settings().SetTheme(&theme.MyTheme{})
+	a.Settings().SetTheme(&apptheme.MyTheme{})
 	w := a.NewWindow("LocalChat - 局域网聊天与文件传输")
-	w.Resize(fyne.NewSize(960, 640))
+	w.Resize(fyne.NewSize(480, 540))
 	w.SetMaster()
 
 	ui := &ChatUI{win: w}
@@ -76,7 +120,7 @@ func Run() {
 	w.ShowAndRun()
 }
 
-// showNameSetup 显示用户名设置界面
+// showNameSetup 显示用户名设置界面（居中欢迎卡片）
 func (ui *ChatUI) showNameSetup() {
 	nameEntry := widget.NewEntry()
 	nameEntry.SetPlaceHolder("例如: 小明")
@@ -87,17 +131,27 @@ func (ui *ChatUI) showNameSetup() {
 	// 回车直接提交（替代Form的OnSubmit行为）
 	nameEntry.OnSubmitted = func(string) { submit() }
 
+	subtitle := widget.NewRichText(&widget.TextSegment{
+		Text: "局域网即时聊天与文件传输\n免登录 · 自动发现附近设备",
+		Style: widget.RichTextStyle{
+			Alignment: fyne.TextAlignCenter,
+			ColorName: theme.ColorNamePlaceHolder,
+			Inline:    false,
+		},
+	})
+
 	form := widget.NewForm(
 		widget.NewFormItem("你的代号", nameEntry),
 	)
 
-	confirmBtn := widget.NewButton("确定", submit)
+	confirmBtn := widget.NewButtonWithIcon("开始使用", theme.ConfirmIcon(), submit)
 	confirmBtn.Importance = widget.HighImportance
-	cancelBtn := widget.NewButton("取消", func() {
+	cancelBtn := widget.NewButtonWithIcon("退出", theme.CancelIcon(), func() {
 		fyne.CurrentApp().Quit()
 	})
+	cancelBtn.Importance = widget.LowImportance
 
-	// 两侧Spacer平分剩余空间，使取消/确定按钮组水平居中
+	// 取消/确定按钮组水平居中
 	buttons := container.NewHBox(
 		layout.NewSpacer(),
 		cancelBtn,
@@ -105,12 +159,26 @@ func (ui *ChatUI) showNameSetup() {
 		layout.NewSpacer(),
 	)
 
-	ui.win.SetContent(container.NewVBox(
-		widget.NewLabelWithStyle("LocalChat", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		widget.NewLabelWithStyle("局域网即时聊天与文件传输工具", fyne.TextAlignCenter, fyne.TextStyle{}),
+	card := container.NewVBox(
+		container.NewCenter(brandLogo(72)),
+		widget.NewRichText(&widget.TextSegment{
+			Text: "LocalChat",
+			Style: widget.RichTextStyle{
+				Alignment: fyne.TextAlignCenter,
+				SizeName:  theme.SizeNameHeadingText,
+				Inline:    false,
+				TextStyle: fyne.TextStyle{Bold: true},
+			},
+		}),
+		subtitle,
+		widget.NewSeparator(),
 		form,
 		buttons,
-	))
+	)
+
+	// 固定宽度内容列 + 垂直水平居中，呈现现代卡片式欢迎页
+	content := container.New(&maxWidthLayout{w: 380}, card)
+	ui.win.SetContent(container.NewCenter(content))
 }
 
 // startClient 创建并启动聊天客户端
@@ -140,12 +208,22 @@ func (ui *ChatUI) bindCallbacks() {
 		ui.uiDo(func() {
 			ui.peers = peers
 			ui.peerList.Refresh()
+			ui.peerCount.SetText(fmt.Sprintf("%d 台设备", len(peers)))
+			if len(peers) == 0 {
+				ui.emptyHint.SetText("正在搜索附近的设备…")
+			} else {
+				ui.emptyHint.SetText(fmt.Sprintf("发现 %d 台设备，点击即可开始聊天", len(peers)))
+			}
+			ui.emptyHint.Hidden = len(peers) > 0
+			ui.emptyHint.Refresh()
 		})
 	}
 
 	c.OnChatStarted = func(peerName string) {
 		ui.uiDo(func() {
+			ui.chatTitle.TextStyle = fyne.TextStyle{Bold: true}
 			ui.chatTitle.SetText(fmt.Sprintf("正在与 %s 聊天", peerName))
+			ui.statusDot.Hidden = false
 			ui.setChatControls(true)
 		})
 	}
@@ -158,7 +236,9 @@ func (ui *ChatUI) bindCallbacks() {
 
 	c.OnChatEnded = func() {
 		ui.uiDo(func() {
+			ui.chatTitle.TextStyle = fyne.TextStyle{Italic: true}
 			ui.chatTitle.SetText("未在聊天中 - 点击左侧用户开始聊天")
+			ui.statusDot.Hidden = true
 			ui.setChatControls(false)
 		})
 	}
@@ -220,27 +300,57 @@ func (ui *ChatUI) bindCallbacks() {
 
 // showMainUI 显示主界面
 func (ui *ChatUI) showMainUI() {
-	// 顶部状态信息
-	info := widget.NewLabel(fmt.Sprintf("代号: %s    IP: %s    TCP端口: %d    接收目录: %s",
-		ui.client.GetName(), ui.client.LocalIP(), ui.client.TCPPort(), ui.client.FileDataDir()))
+	ui.win.Resize(fyne.NewSize(1000, 660))
 
-	// 左侧：在线用户列表
+	// ===== 顶部栏：品牌 + 本机信息 =====
+	ui.headerInfo = widget.NewRichText(&widget.TextSegment{
+		Text: fmt.Sprintf("代号 %s    IP %s    TCP端口 %d    接收目录 %s",
+			ui.client.GetName(), ui.client.LocalIP(), ui.client.TCPPort(), ui.client.FileDataDir()),
+		Style: widget.RichTextStyle{
+			ColorName: theme.ColorNamePlaceHolder,
+			SizeName:  theme.SizeNameCaptionText,
+			Inline:    false,
+		},
+	})
+	appName := widget.NewRichText(&widget.TextSegment{
+		Text:  "LocalChat",
+		Style: widget.RichTextStyle{Inline: true, TextStyle: fyne.TextStyle{Bold: true}},
+	})
+	// 品牌名靠左、本机信息靠右，一行排开
+	headerRow := container.NewBorder(nil, nil, brandLogo(36), nil,
+		container.NewHBox(appName, layout.NewSpacer(), ui.headerInfo))
+	headerBar := container.NewVBox(
+		container.NewPadded(headerRow),
+		widget.NewSeparator(),
+	)
+
+	// ===== 左侧：在线用户列表 =====
+	ui.peerCount = widget.NewLabel("0 台设备")
+	ui.peerCount.TextStyle = fyne.TextStyle{Italic: true}
+
+	peerTitle := widget.NewLabelWithStyle("在线用户", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
 	ui.peerList = widget.NewList(
 		func() int { return len(ui.peers) },
 		func() fyne.CanvasObject {
-			return container.NewVBox(
-				widget.NewLabelWithStyle("用户名", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-				widget.NewLabel("ip:port"),
-			)
+			dot := canvas.NewCircle(theme.SuccessColor())
+			dotWrap := container.NewGridWrap(fyne.NewSize(9, 9), dot)
+			dotAlign := container.New(layout.NewVBoxLayout(), dotWrap) // 顶部对齐小圆点
+			name := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			addr := canvas.NewText("", theme.PlaceHolderColor())
+			addr.TextSize = 11
+			info := container.NewVBox(name, addr)
+			return container.NewHBox(dotAlign, info)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			box := obj.(*fyne.Container)
+			box := obj.(*fyne.Container).Objects[1].(*fyne.Container)
 			name := box.Objects[0].(*widget.Label)
-			addr := box.Objects[1].(*widget.Label)
+			addr := box.Objects[1].(*canvas.Text)
 			if id < len(ui.peers) {
 				p := ui.peers[id]
 				name.SetText(p.Name)
-				addr.SetText(fmt.Sprintf("%s:%d", p.IP, p.Port))
+				addr.Text = fmt.Sprintf("%s:%d", p.IP, p.Port)
+				addr.Refresh()
 			}
 		})
 	ui.peerList.OnSelected = func(id widget.ListItemID) {
@@ -249,13 +359,22 @@ func (ui *ChatUI) showMainUI() {
 		}
 	}
 
-	peersPanel := container.NewBorder(
-		container.NewVBox(widget.NewLabelWithStyle("在线用户", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})),
-		nil, nil, nil,
-		ui.peerList)
+	ui.emptyHint = widget.NewLabelWithStyle("正在搜索附近的设备…",
+		fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
+	peersStack := container.NewStack(ui.peerList, container.NewCenter(ui.emptyHint))
 
-	// 右侧：聊天区
-	ui.chatTitle = widget.NewLabelWithStyle("未在聊天中 - 点击左侧用户开始聊天", fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
+	peersPanel := container.NewBorder(
+		container.NewVBox(peerTitle, widget.NewSeparator()),
+		nil, nil, nil,
+		peersStack)
+
+	// ===== 右侧：聊天区 =====
+	ui.chatTitle = widget.NewLabelWithStyle("未在聊天中 - 点击左侧用户开始聊天",
+		fyne.TextAlignLeading, fyne.TextStyle{Italic: true})
+
+	ui.statusDot = canvas.NewCircle(theme.SuccessColor())
+	ui.statusDot.Hidden = true
+	dotWrap := container.NewGridWrap(fyne.NewSize(9, 9), ui.statusDot)
 
 	// 聊天记录使用Label而非禁用的Entry：Entry被Disable后文字渲染成低对比度灰色，
 	// 系统通知和聊天内容都看不清；Label使用正常前景色且天然只读
@@ -264,33 +383,40 @@ func (ui *ChatUI) showMainUI() {
 	ui.chatScroll = container.NewScroll(ui.chatLog)
 
 	ui.msgInput = widget.NewEntry()
-	ui.msgInput.SetPlaceHolder("输入消息，回车发送...")
+	ui.msgInput.SetPlaceHolder("输入消息，回车发送…")
 	ui.msgInput.OnSubmitted = func(string) { ui.sendMsg() }
 	ui.msgInput.Disable()
 
-	sendBtn := widget.NewButton("发送", ui.sendMsg)
+	sendBtn := widget.NewButtonWithIcon("发送", theme.MailSendIcon(), ui.sendMsg)
+	sendBtn.Importance = widget.HighImportance
 
-	ui.sendFileBtn = widget.NewButton("发送文件...", ui.pickFile)
+	ui.sendFileBtn = widget.NewButtonWithIcon("发送文件…", theme.FileIcon(), ui.pickFile)
+	ui.sendFileBtn.Importance = widget.LowImportance
 	ui.sendFileBtn.Disable()
-	ui.sendFolderBtn = widget.NewButton("发送文件夹...", ui.pickFolder)
+	ui.sendFolderBtn = widget.NewButtonWithIcon("发送文件夹…", theme.FolderOpenIcon(), ui.pickFolder)
+	ui.sendFolderBtn.Importance = widget.LowImportance
 	ui.sendFolderBtn.Disable()
-	ui.endChatBtn = widget.NewButton("结束聊天", func() { ui.client.EndChat() })
+	ui.endChatBtn = widget.NewButtonWithIcon("结束聊天", theme.CancelIcon(), func() { ui.client.EndChat() })
+	ui.endChatBtn.Importance = widget.DangerImportance
 	ui.endChatBtn.Disable()
 
+	inputRow := container.NewBorder(nil, nil, nil, sendBtn, ui.msgInput)
+	actionRow := container.NewHBox(ui.sendFileBtn, ui.sendFolderBtn, layout.NewSpacer(), ui.endChatBtn)
+
+	chatHeader := container.NewBorder(nil, nil, dotWrap, nil,
+		container.NewVBox(ui.chatTitle, widget.NewSeparator()))
+
 	chatPanel := container.NewBorder(
-		ui.chatTitle,
-		container.NewVBox(
-			container.NewBorder(nil, nil, nil, sendBtn, ui.msgInput),
-			container.NewHBox(ui.sendFileBtn, ui.sendFolderBtn, layout.NewSpacer(), ui.endChatBtn),
-		),
+		chatHeader,
+		container.NewVBox(inputRow, actionRow),
 		nil, nil,
-		ui.chatScroll,
+		container.NewPadded(ui.chatScroll),
 	)
 
 	split := container.NewHSplit(peersPanel, chatPanel)
-	split.Offset = 0.28
+	split.Offset = 0.26
 
-	ui.win.SetContent(container.NewBorder(info, nil, nil, nil, split))
+	ui.win.SetContent(container.NewBorder(headerBar, nil, nil, nil, split))
 
 	// 关闭窗口时优雅退出
 	ui.win.SetCloseIntercept(func() {
