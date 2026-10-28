@@ -4,9 +4,9 @@
 
 ## 运行方法
 
-### 仓库中提供了windows版本的程序压缩包
+### 仓库中提供了windows版本的软件
 
-- localchat.zip解压后的localchat.exe可直接使用
+- 文件夹 downloads\v0.0.3\localchat.exe可直接使用
 
 ###### 运行效果演示
 
