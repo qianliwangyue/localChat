@@ -13,3 +13,7 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# Inno Setup 编译产物 (安装包不入库, 上传到 Partner Center / GitHub Releases)
+dist/
+LoacalCP-setup-*.exe
