@@ -29,7 +29,7 @@ type ChatUI struct {
 	peers []common.Peer // 在线用户快照
 
 	peerList   *widget.List
-	chatLog    *widget.Label
+	chatLog    *readOnlyEntry
 	chatScroll *container.Scroll
 	msgInput   *widget.Entry
 	chatTitle  *widget.Label
@@ -46,10 +46,13 @@ type ChatUI struct {
 
 	pendingDirWarning string // 启动时接收目录回退的提示，等主界面就绪后再写入日志
 
-	// 传输进度对话框
-	progressDlg   *dialog.ProgressDialog
-	progressLabel string
-	lastPct       int
+	// 传输进度对话框（进度条 + 取消按钮）
+	progressDlg     dialog.Dialog
+	progressBar     *widget.ProgressBar
+	progressBtn     *widget.Button
+	progressLabel   string
+	progressSending bool
+	lastPct         int
 
 	ready bool // 主界面控件是否已创建
 }
@@ -299,7 +302,7 @@ func (ui *ChatUI) bindCallbacks() {
 	}
 
 	c.OnFileProgress = func(pct int, sending bool, label string) {
-		ui.uiDo(func() { ui.updateProgress(pct, label) })
+		ui.uiDo(func() { ui.updateProgress(pct, sending, label) })
 	}
 
 	// 断点续传开始：在进度条上方留下一条提示，用户能看到不是从头再传
@@ -410,10 +413,10 @@ func (ui *ChatUI) showMainUI() {
 	ui.statusDot.Hidden = true
 	dotWrap := container.NewGridWrap(fyne.NewSize(9, 9), ui.statusDot)
 
-	// 聊天记录使用Label而非禁用的Entry：Entry被Disable后文字渲染成低对比度灰色，
-	// 系统通知和聊天内容都看不清；Label使用正常前景色且天然只读
-	ui.chatLog = widget.NewLabel("")
-	ui.chatLog.Wrapping = fyne.TextWrapBreak
+	// 聊天记录用「只读 Entry」而非 Label/禁用的 Entry：
+	// Label 不可选中复制；Disable 的 Entry 文字会渲染成低对比度灰色且无法选中。
+	// readOnlyEntry 保持正常前景色，支持鼠标选中、双击选词、Ctrl+C 与右键复制。
+	ui.chatLog = newReadOnlyEntry()
 	ui.chatScroll = container.NewScroll(ui.chatLog)
 
 	ui.msgInput = widget.NewEntry()
@@ -434,10 +437,22 @@ func (ui *ChatUI) showMainUI() {
 	ui.endChatBtn.Importance = widget.DangerImportance
 	ui.endChatBtn.Disable()
 
+	// 清空聊天记录按钮（聊天区右上角）
+	clearChatBtn := widget.NewButtonWithIcon("清空记录", theme.DeleteIcon(), func() {
+		dialog.ShowConfirm("清空聊天记录", "确定要清空当前聊天记录吗？此操作不可恢复。",
+			func(ok bool) {
+				if ok {
+					ui.chatLog.SetText("")
+				}
+			}, ui.win)
+	})
+	clearChatBtn.Importance = widget.LowImportance
+
 	inputRow := container.NewBorder(nil, nil, nil, sendBtn, ui.msgInput)
 	actionRow := container.NewHBox(ui.sendFileBtn, ui.sendFolderBtn, layout.NewSpacer(), ui.endChatBtn)
 
-	chatHeader := container.NewBorder(nil, nil, dotWrap, nil,
+	chatHeader := container.NewBorder(nil, nil, dotWrap,
+		container.NewPadded(container.NewVBox(clearChatBtn)),
 		container.NewVBox(ui.chatTitle, widget.NewSeparator()))
 
 	chatPanel := container.NewBorder(
@@ -543,6 +558,55 @@ func (ui *ChatUI) showSettings() {
 	}, ui.win)
 	d.Show()
 	d.Resize(fyne.NewSize(580, 240))
+}
+
+// readOnlyEntry 只读多行文本框：内容可选可复制，但不可编辑。
+//   - 保持启用状态（正常前景色），吞掉所有会修改内容的按键输入
+//   - Wrapping=Off + Scroll=None 让控件随内容自然增长，滚动交给外层
+//     container.Scroll（appendLog 里能 ScrollToBottom 自动跟底）
+type readOnlyEntry struct {
+	widget.Entry
+}
+
+func newReadOnlyEntry() *readOnlyEntry {
+	e := &readOnlyEntry{}
+	e.MultiLine = true
+	e.Wrapping = fyne.TextWrapOff
+	e.Scroll = fyne.ScrollNone
+	e.ExtendBaseWidget(e)
+	return e
+}
+
+// TypedRune 吞掉字符输入，聊天记录不可编辑
+func (e *readOnlyEntry) TypedRune(rune) {}
+
+// TypedKey 吞掉普通按键（退格、删除、回车、方向键等）
+func (e *readOnlyEntry) TypedKey(*fyne.KeyEvent) {}
+
+// TypedShortcut 只放行不改内容的快捷键（复制/全选），拦下粘贴、剪切等
+func (e *readOnlyEntry) TypedShortcut(s fyne.Shortcut) {
+	switch s.(type) {
+	case *fyne.ShortcutCopy, *fyne.ShortcutSelectAll:
+		e.Entry.TypedShortcut(s)
+	}
+}
+
+// TappedSecondary 自定义右键菜单：只保留「复制/全选」，
+// 避免默认菜单里的粘贴/剪切把聊天记录改掉
+func (e *readOnlyEntry) TappedSecondary(ev *fyne.PointEvent) {
+	canvas := fyne.CurrentApp().Driver().CanvasForObject(e)
+	if canvas == nil {
+		return
+	}
+	menu := fyne.NewMenu("",
+		fyne.NewMenuItem("复制", func() {
+			e.Entry.TypedShortcut(&fyne.ShortcutCopy{Clipboard: fyne.CurrentApp().Clipboard()})
+		}),
+		fyne.NewMenuItem("全选", func() {
+			e.Entry.TypedShortcut(&fyne.ShortcutSelectAll{})
+		}),
+	)
+	widget.NewPopUpMenu(menu, canvas).ShowAtPosition(ev.AbsolutePosition)
 }
 
 // appendLog 向聊天日志追加一行，并自动滚动到底部保证新消息可见
@@ -651,22 +715,51 @@ func windowsPath(p string) string {
 	return p
 }
 
-// updateProgress 显示/更新传输进度对话框
-func (ui *ChatUI) updateProgress(pct int, label string) {
-	// 标题变化时重建对话框
-	if ui.progressDlg == nil || label != ui.progressLabel {
+// updateProgress 显示/更新传输进度对话框。
+// 进度条下方带一个「取消」按钮，点击后二次确认是否放弃传输。
+func (ui *ChatUI) updateProgress(pct int, sending bool, label string) {
+	// 标题或方向变化时重建对话框
+	if ui.progressDlg == nil || label != ui.progressLabel || sending != ui.progressSending {
 		if ui.progressDlg != nil {
 			ui.progressDlg.Hide()
 		}
-		ui.progressDlg = dialog.NewProgress("文件传输", label, ui.win)
+		ui.progressSending = sending
+		ui.progressBar = widget.NewProgressBar()
+
+		ui.progressBtn = widget.NewButtonWithIcon("取消", theme.CancelIcon(), nil)
+		btn := ui.progressBtn
+		btn.OnTapped = func() { ui.confirmAbortTransfer(sending) }
+
+		// 固定最小宽度 300：默认对话框按内容自适应，进度条会窄得没法看
+		body := container.NewVBox(
+			widget.NewLabel(label),
+			ui.progressBar,
+			container.NewCenter(btn),
+		)
+		content := container.NewPadded(container.New(&maxWidthLayout{w: 300}, body))
+		ui.progressDlg = dialog.NewCustomWithoutButtons("文件传输", content, ui.win)
 		ui.progressDlg.Show()
 		ui.progressLabel = label
 		ui.lastPct = -1
 	}
 	if pct != ui.lastPct {
-		ui.progressDlg.SetValue(float64(pct) / 100)
+		ui.progressBar.SetValue(float64(pct) / 100)
 		ui.lastPct = pct
 	}
+}
+
+// confirmAbortTransfer 二次确认是否放弃传输：选「是」停止，选「否」继续。
+func (ui *ChatUI) confirmAbortTransfer(sending bool) {
+	title, ask, action := "放弃接收", "是否放弃接收？", ui.client.CancelReceiving
+	if sending {
+		title, ask, action = "放弃发送", "是否放弃发送？", ui.client.CancelSending
+	}
+	dialog.ShowConfirm(title, ask, func(ok bool) {
+		if ok {
+			go action()
+		}
+		// 选「否」：什么都不做，传输继续
+	}, ui.win)
 }
 
 // endProgress 关闭传输进度对话框
@@ -674,6 +767,8 @@ func (ui *ChatUI) endProgress() {
 	if ui.progressDlg != nil {
 		ui.progressDlg.Hide()
 		ui.progressDlg = nil
+		ui.progressBar = nil
+		ui.progressBtn = nil
 		ui.progressLabel = ""
 	}
 }

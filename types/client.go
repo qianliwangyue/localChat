@@ -1758,13 +1758,51 @@ func (c *ChatClient) handleFileMessage(msg *common.Message, _ net.Conn) {
 	case common.MsgTypeFileDone:
 		c.finalizeReceivingFile(msg)
 	case common.MsgTypeFileCancel:
-		// 明确取消（对方中止或用户取消）：临时文件不再有用，直接删除
+		// 先看这个文件是不是本端正在发送：是则说明对方放弃了接收
+		c.fileMutex.Lock()
+		tf, sendingNow := c.sendingFiles[msg.FileID]
+		if sendingNow {
+			tf.Canceled = true
+		}
+		c.fileMutex.Unlock()
+		if sendingNow {
+			// 打完取消标记后由发送循环自己退出（FileDone 不再发出）
+			c.cleanupSendingFile(msg.FileID)
+			if c.OnTransferEnded != nil {
+				c.OnTransferEnded(true, "对方放弃了接收，传输已取消")
+			}
+			return
+		}
+
+		// 接收端视角：明确取消（对方中止或用户取消），临时文件不再有用，直接删除
+		c.fileMutex.Lock()
+		folderID := ""
+		if tf, ok := c.receivingFiles[msg.FileID]; ok {
+			folderID = tf.FolderID
+		}
+		c.fileMutex.Unlock()
 		c.cleanupReceivingFile(msg.FileID, true)
+
+		folderPath := ""
+		if folderID != "" {
+			// 文件夹内的文件被取消时，整个文件夹接收一并放弃，
+			// 否则 receiving 状态会卡死，后续文件请求都被拒
+			c.fileMutex.Lock()
+			if f, ok := c.receivingFolders[folderID]; ok {
+				folderPath = f.FolderPath
+				delete(c.receivingFolders, folderID)
+			}
+			c.receiving = false
+			c.fileMutex.Unlock()
+			if folderPath != "" {
+				removeFolderMarker(folderPath)
+			}
+		}
 		c.fileMutex.Lock()
 		c.transmitting = false
 		c.fileMutex.Unlock()
 		if c.OnTransferEnded != nil {
-			c.OnTransferEnded(false, "对方取消了文件传输")
+			c.OnTransferEnded(false, "对方放弃了发送，传输已取消")
 		}
 	}
 }
@@ -2130,6 +2168,12 @@ func (c *ChatClient) sendFilesInFolder(folderID string) {
 
 	// 发送每个文件
 	for transferFolder.CurrentFile < transferFolder.TotalFiles {
+		// 用户放弃发送或对方放弃接收：立即终止整个文件夹
+		if c.isFolderCanceled(transferFolder) {
+			c.cleanupSendingFolder(folderID)
+			return
+		}
+
 		filePath := transferFolder.Files[transferFolder.CurrentFile]
 
 		// 计算相对路径
@@ -2201,6 +2245,13 @@ func (c *ChatClient) sendFilesInFolder(folderID string) {
 
 		// 等待当前文件传输结束（接受后被 sendFileData 消费，拒绝/失败时由 cleanup 唤醒）
 		c.waitSendingFileDone(fileID)
+
+		// 当前文件被取消（用户放弃发送/对方放弃接收）时终止整个文件夹，
+		// 而不是继续把剩余文件一个一个发给已经不想收的对端
+		if c.isSendCanceled(transferFile) || c.isFolderCanceled(transferFolder) {
+			c.cleanupSendingFolder(folderID)
+			return
+		}
 
 		transferFolder.CurrentFile++
 		fileProgress := int(float64(transferFolder.CurrentFile) / float64(transferFolder.TotalFiles) * 100)
@@ -2276,6 +2327,100 @@ func (c *ChatClient) waitSendingFileDone(fileID string) {
 	}
 }
 
+// isSendCanceled 读取发送取消标记（跨协程访问，必须在锁内读）。
+func (c *ChatClient) isSendCanceled(tf *TransferringFile) bool {
+	c.fileMutex.Lock()
+	defer c.fileMutex.Unlock()
+	return tf.Canceled
+}
+
+// isFolderCanceled 读取文件夹发送取消标记（跨协程访问，必须在锁内读）。
+func (c *ChatClient) isFolderCanceled(f *TransferringFolder) bool {
+	c.fileMutex.Lock()
+	defer c.fileMutex.Unlock()
+	return f.Canceled
+}
+
+// CancelSending 用户主动放弃发送（GUI 调用）。
+// 给对端发 FileCancel 让接收方立即停止，并给本端所有发送任务打上取消标记，
+// 发送循环检测到后安静退出。传输中没有任何任务时是空操作。
+func (c *ChatClient) CancelSending() {
+	c.fileMutex.Lock()
+	var fileIDs []string
+	for id, tf := range c.sendingFiles {
+		tf.Canceled = true
+		fileIDs = append(fileIDs, id)
+	}
+	var folderIDs []string
+	for id, f := range c.sendingFolders {
+		f.Canceled = true
+		folderIDs = append(folderIDs, id)
+	}
+	c.fileMutex.Unlock()
+	if len(fileIDs) == 0 && len(folderIDs) == 0 {
+		return
+	}
+
+	// 通知接收方停止：接收端收到后清理临时文件并复位状态
+	for _, id := range fileIDs {
+		c.writeProtocolMsg(&common.Message{
+			Type:   common.MsgTypeFileCancel,
+			From:   c.name,
+			FileID: id,
+		})
+		c.cleanupSendingFile(id)
+	}
+	for _, id := range folderIDs {
+		c.cleanupSendingFolder(id)
+	}
+	//c.logf("已放弃发送")
+	if c.OnTransferEnded != nil {
+		c.OnTransferEnded(true, "已放弃发送")
+	}
+}
+
+// CancelReceiving 用户主动放弃接收（GUI 调用）。
+// 通知发送方停止，丢弃已收到的临时文件与续传断点，并复位接收状态。
+// 传输中没有任何任务时是空操作。
+func (c *ChatClient) CancelReceiving() {
+	c.fileMutex.Lock()
+	var fileIDs []string
+	var folderPaths []string
+	for id := range c.receivingFiles {
+		fileIDs = append(fileIDs, id)
+	}
+	for id, f := range c.receivingFolders {
+		folderPaths = append(folderPaths, f.FolderPath)
+		delete(c.receivingFolders, id)
+	}
+	c.fileMutex.Unlock()
+	if len(fileIDs) == 0 && len(folderPaths) == 0 {
+		return
+	}
+
+	// 通知发送方停止：发送循环检测到取消标记后安静退出
+	for _, id := range fileIDs {
+		c.writeProtocolMsg(&common.Message{
+			Type:   common.MsgTypeFileCancel,
+			From:   c.name,
+			FileID: id,
+		})
+		// 明确放弃：临时文件与续传断点一并丢弃
+		c.cleanupReceivingFile(id, true)
+	}
+	// 文件夹续传标记也清掉，下次重发同名文件夹从全新目录开始
+	for _, p := range folderPaths {
+		removeFolderMarker(p)
+	}
+	c.fileMutex.Lock()
+	c.receiving = false
+	c.fileMutex.Unlock()
+	//c.logf("已放弃接收")
+	if c.OnTransferEnded != nil {
+		c.OnTransferEnded(false, "已放弃接收")
+	}
+}
+
 // 发送文件数据。
 // resume 为接收端要求的续传起点（0 表示从头发），proto2 表示双方都支持协议 v2。
 func (c *ChatClient) sendFileData(fileID string, resume int64, proto2 bool) {
@@ -2305,6 +2450,13 @@ func (c *ChatClient) sendFileData(fileID string, resume int64, proto2 bool) {
 	}
 
 	for transferFile.CurrentChunk < transferFile.TotalChunks {
+		// 用户放弃发送（本端取消）或对方放弃接收（对端 FileCancel）时安静退出：
+		// 取消方已经负责发送 FileCancel、清理资源并回调 UI，这里不再重复
+		if c.isSendCanceled(transferFile) {
+			c.cleanupSendingFile(fileID)
+			return
+		}
+
 		// 一次尽量读满一个数据块：os.File.Read 可能提前返回，
 		// 按实际字节数推进块序号会造成块大小与总块数不匹配，因此这里补齐到整块
 		n, err := io.ReadFull(transferFile.File, buf)
@@ -2379,13 +2531,20 @@ func (c *ChatClient) sendFileData(fileID string, resume int64, proto2 bool) {
 			return
 		}
 
-		// 进度节流：仅在百分比变化且距上次回调超过间隔时通知，避免刷爆UI队列
-		if c.OnFileProgress != nil && progress != lastPct &&
-			(progress >= 100 || time.Since(lastReport) >= progressInterval) {
+		// 进度节流：仅在百分比变化且距上次回调超过间隔时通知，避免刷爆UI队列。
+		// 回调必须在持有 fileMutex 时发出：FileCancel 处理协程在同一临界区内
+		// 设置取消标记，锁的互斥保证「进度」与「结束」两组回调不会乱序——
+		// 否则取消时一个迟到的进度回调会在 UI 上重建 endProgress 刚关闭的
+		// 进度对话框，留下一个永远没人关闭的传输窗口（小概率但可复现）。
+		c.fileMutex.Lock()
+		fire := !transferFile.Canceled && c.OnFileProgress != nil && progress != lastPct &&
+			(progress >= 100 || time.Since(lastReport) >= progressInterval)
+		if fire {
 			c.OnFileProgress(progress, true, fmt.Sprintf("发送文件 %s", transferFile.FileName))
 			lastPct = progress
 			lastReport = time.Now()
 		}
+		c.fileMutex.Unlock()
 
 		transferFile.CurrentChunk++
 
@@ -2491,7 +2650,7 @@ func (c *ChatClient) writeReceivedChunk(msg *common.Message, data []byte) {
 	transferFile, exists := c.receivingFiles[msg.FileID]
 	if !exists {
 		c.fileMutex.Unlock()
-		c.logf("找不到接收文件信息: %s", msg.FileID)
+		//c.logf("找不到接收文件信息: %s", msg.FileID)
 		return
 	}
 
@@ -2528,7 +2687,10 @@ func (c *ChatClient) writeReceivedChunk(msg *common.Message, data []byte) {
 		ackOffset = transferFile.Written
 	}
 
-	// 通知进度（节流规则与发送端一致，避免高速传输时刷爆UI队列）
+	// 通知进度（节流规则与发送端一致，避免高速传输时刷爆UI队列）。
+	// 与发送端同理：回调必须在持锁时发出，否则用户 CancelReceiving 删除
+	// 接收项并触发「已放弃接收」后，一个迟到的进度回调会在 UI 上重建
+	// 刚关闭的进度对话框，卡在传输页面。
 	notify := false
 	pct := msg.Progress
 	if c.OnFileProgress != nil && pct != transferFile.LastPct &&
@@ -2539,6 +2701,9 @@ func (c *ChatClient) writeReceivedChunk(msg *common.Message, data []byte) {
 	}
 	fileName := transferFile.FileName
 	savePath, key, size := transferFile.FilePath, transferFile.FileKey, transferFile.FileSize
+	if notify {
+		c.OnFileProgress(pct, false, fmt.Sprintf("接收文件 %s", fileName))
+	}
 	c.fileMutex.Unlock()
 
 	if ackOffset > 0 {
@@ -2554,10 +2719,6 @@ func (c *ChatClient) writeReceivedChunk(msg *common.Message, data []byte) {
 		}); err != nil {
 			c.logf("更新续传断点失败: %v", err)
 		}
-	}
-
-	if notify {
-		c.OnFileProgress(pct, false, fmt.Sprintf("接收文件 %s", fileName))
 	}
 
 	// 如果所有数据块都已接收，不需要做特殊处理，因为发送方会发送FileDone消息

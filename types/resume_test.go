@@ -388,9 +388,11 @@ func TestLegacyPeerCompat(t *testing.T) {
 	sendJSON(map[string]any{"type": "file_done", "fileID": "legacy1", "fileName": "legacy.txt"})
 
 	savePath := filepath.Join("received_files", "legacy.txt")
+	// 等文件大小正确而不是只等存在：AcceptFile 在接受时就 os.Create 了目标文件，
+	// 此刻内容还是空的，只等存在会读到空文件（全量跑时的偶发失败来源）
 	waitFor(t, 10*time.Second, func() bool {
-		_, err := os.Stat(savePath)
-		return err == nil
+		info, err := os.Stat(savePath)
+		return err == nil && info.Size() == int64(len(payload))
 	}, "旧版本通道的文件应接收完成")
 	got, err := os.ReadFile(savePath)
 	if err != nil {

@@ -31,6 +31,10 @@ type TransferringFile struct {
 	Acked     int64  // 发送端：已被对端 ACK 确认的字节数
 	LastAckAt int64  // 接收端：上次发送 ACK 时的已写字节数
 	Sent      int64  // 发送端：本次已发出的字节数（含续传起点前的部分）
+
+	// 发送端取消标记：写操作必须在 fileMutex 内，读操作用 isSendCanceled()
+	// （发送循环与消息处理协程并发访问）
+	Canceled bool
 }
 
 // 文件夹传输信息
@@ -43,4 +47,7 @@ type TransferringFolder struct {
 	CurrentFile int
 	TotalFiles  int
 	Files       []string // 文件列表
+
+	// 发送端取消标记：写操作必须在 fileMutex 内，读操作用 isFolderCanceled()
+	Canceled bool
 }
