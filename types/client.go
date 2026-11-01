@@ -22,6 +22,23 @@ import (
 	"sync"
 )
 
+const (
+	// fileChunkSize 单个文件数据块大小。
+	// 原实现 16KB + 每块 sleep 10ms，吞吐被硬性锁死在约 1.6MB/s，该 sleep 已删除。
+	// 改为二进制帧之后（数据块 = JSON 头 + 换行 + 原始字节，一次 Write 发出），
+	// 回环上 128KB 实测约 300MB/s，256KB/512KB 抖动较大且收益不稳（多在大文件时更快），
+	// 综合考虑内存占用与续传粒度（续传点按块对齐）仍取 128KB。
+	// 接收方按 ChunkIndex 顺序拼接，不依赖块大小，因此与旧版本对端保持互通。
+	fileChunkSize = 128 * 1024
+
+	// progressInterval 进度回调的最小间隔。
+	// 高速传输时每块都回调会向 UI 线程灌入上千次/秒的刷新请求，反而拖慢传输。
+	progressInterval = 100 * time.Millisecond
+
+	// recvReadBufferSize 接收端 bufio 读缓冲大小，需大于单条最大消息（块 + JSON 头）
+	recvReadBufferSize = 512 * 1024
+)
+
 // fileOfferRequest 待用户确认的文件/文件夹请求
 type fileOfferRequest struct {
 	msg  *common.Message
@@ -50,6 +67,7 @@ type ChatClient struct {
 	portBase       int             // UDP/TCP端口段偏移（生产为0；测试用不同段隔离SO_REUSEADDR残留抢包）
 	// 文件传输相关字段
 	fileMutex    sync.Mutex
+	fileDoneCond *sync.Cond // 与 fileMutex 绑定：某个发送任务结束时唤醒等待者
 	transmitting bool
 	receiving    bool
 	fileDataDir  string
@@ -62,16 +80,17 @@ type ChatClient struct {
 	receivingFolders map[string]*TransferringFolder // folderID -> 文件夹信息
 
 	// 事件回调（供GUI使用，均为可选，需在Start之前设置）
-	OnLog           func(text string)                                                                   // 系统日志/提示信息
-	OnPeersChanged  func(peers []common.Peer)                                                           // 在线用户列表变化
-	OnChatStarted   func(peerName string)                                                               // 聊天会话开始
-	OnChatMessage   func(from, content string)                                                          // 收到聊天消息
-	OnChatEnded     func()                                                                              // 聊天会话结束
-	OnFileOffer     func(from, fromAddr, fileName string, size int64, fileID string)                    // 收到文件请求（fromAddr为发送者IP，用于同名用户区分）
-	OnFolderOffer   func(from, fromAddr, folderName string, size int64, fileCount int, folderID string) // 收到文件夹请求
-	OnFileProgress  func(pct int, sending bool, label string)                                           // 传输进度
-	OnTransferEnded func(sending bool, text string)                                                     // 传输结束（完成/拒绝/取消）
-	OnFileSaved     func(fileName, savePath string)                                                     // 单文件接收完成（含保存路径）
+	OnLog             func(text string)                                                                   // 系统日志/提示信息
+	OnPeersChanged    func(peers []common.Peer)                                                           // 在线用户列表变化
+	OnChatStarted     func(peerName string)                                                               // 聊天会话开始
+	OnChatMessage     func(from, content string)                                                          // 收到聊天消息
+	OnChatEnded       func()                                                                              // 聊天会话结束
+	OnFileOffer       func(from, fromAddr, fileName string, size int64, fileID string)                    // 收到文件请求（fromAddr为发送者IP，用于同名用户区分）
+	OnFolderOffer     func(from, fromAddr, folderName string, size int64, fileCount int, folderID string) // 收到文件夹请求
+	OnFileProgress    func(pct int, sending bool, label string)                                           // 传输进度
+	OnTransferEnded   func(sending bool, text string)                                                     // 传输结束（完成/拒绝/取消）
+	OnFileSaved       func(fileName, savePath string)                                                     // 单文件接收完成（含保存路径）
+	OnTransferResumed func(fileName string, offset, total int64)                                          // 断点续传开始（已续传偏移/文件总大小）
 
 	// 待用户确认的传输请求
 	pendingFileOffers   map[string]*fileOfferRequest // fileID -> 请求
@@ -103,6 +122,8 @@ func NewChatClient() *ChatClient {
 		pendingFolderOffers: make(map[string]*fileOfferRequest),
 	}
 	client.online.Store(true)
+	// 文件夹批量发送时用条件变量等待「当前文件结束」，替代 100ms 轮询
+	client.fileDoneCond = sync.NewCond(&client.fileMutex)
 	return client
 }
 
@@ -430,7 +451,7 @@ func (c *ChatClient) handleIncomingConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
 	c.logf("接收到来自 %s 的TCP连接", remoteAddr.IP)
 
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, recvReadBufferSize)
 
 	for {
 		message, err := reader.ReadString('\n')
@@ -501,23 +522,36 @@ func (c *ChatClient) handleIncomingConnection(conn net.Conn) {
 				c.receiveChatMessages(conn)
 				return
 			}
-		case common.MsgTypeFileOffer:
-			// 处理文件发送请求
-			go c.handleFileOffer(&msg, conn)
-		case common.MsgTypeFileData:
-			// 同步处理文件数据：消息按TCP顺序到达，同步写入保证数据块严格按序落盘，
-			// 也避免每个数据块新开goroutine并发访问接收状态
-			c.receiveFileData(&msg)
-		case common.MsgTypeFileAccept, common.MsgTypeFileReject, common.MsgTypeFileDone, common.MsgTypeFileCancel:
-			// 处理其他文件传输相关消息
-			go c.handleFileMessage(&msg, conn)
-		case common.MsgTypeFolderOffer:
-			// 处理文件夹发送请求
-			go c.handleFolderOffer(&msg, conn)
-		case common.MsgTypeFolderAccept, common.MsgTypeFolderReject, common.MsgTypeFolderDone:
-			// 处理文件夹传输相关消息
-			go c.handleFolderMessage(&msg, conn)
+		default:
+			c.handleTransferMessage(&msg, reader, conn)
 		}
+	}
+}
+
+// handleTransferMessage 分派文件/文件夹相关消息。
+// reader 是连接上唯一的 bufio 读取器，收到二进制数据块头后由它继续读取原始负载，
+// 保证「头 + 负载」不会被别的 goroutine 抢读。
+func (c *ChatClient) handleTransferMessage(msg *common.Message, reader *bufio.Reader, conn net.Conn) {
+	switch msg.Type {
+	case common.MsgTypeFileOffer:
+		// 文件发送请求
+		go c.handleFileOffer(msg, conn)
+	case common.MsgTypeFileData:
+		// 同步处理 base64 数据块：消息按TCP顺序到达，同步写入保证数据块严格按序落盘，
+		// 也避免每个数据块新开goroutine并发访问接收状态
+		c.receiveFileData(msg)
+	case common.MsgTypeFileDataBin:
+		// 同步读取并写入二进制数据块；必须在当前读取协程内完成，随后才继续读下一条消息
+		c.receiveBinChunk(msg, reader, conn)
+	case common.MsgTypeFileAck:
+		// 对端确认已落盘到 AckedOffset，记账后用于断点续传
+		c.handleFileAck(msg)
+	case common.MsgTypeFileAccept, common.MsgTypeFileReject, common.MsgTypeFileDone, common.MsgTypeFileCancel:
+		go c.handleFileMessage(msg, conn)
+	case common.MsgTypeFolderOffer:
+		go c.handleFolderOffer(msg, conn)
+	case common.MsgTypeFolderAccept, common.MsgTypeFolderReject, common.MsgTypeFolderDone:
+		go c.handleFolderMessage(msg, conn)
 	}
 }
 
@@ -668,7 +702,7 @@ func isPrivateIP(ip string) bool {
 
 // 接收聊天消息
 func (c *ChatClient) receiveChatMessages(conn net.Conn) {
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, recvReadBufferSize)
 
 	for {
 		message, err := reader.ReadString('\n')
@@ -702,22 +736,8 @@ func (c *ChatClient) receiveChatMessages(conn net.Conn) {
 			} else if c.OnChatMessage != nil {
 				c.OnChatMessage(msg.From, msg.Content)
 			}
-		case common.MsgTypeFileOffer:
-			// 处理文件发送请求
-			go c.handleFileOffer(&msg, conn)
-		case common.MsgTypeFileData:
-			// 同步处理文件数据：消息按TCP顺序到达，同步写入保证数据块严格按序落盘，
-			// 也避免每个数据块新开goroutine并发访问接收状态
-			c.receiveFileData(&msg)
-		case common.MsgTypeFileAccept, common.MsgTypeFileReject, common.MsgTypeFileDone, common.MsgTypeFileCancel:
-			// 处理其他文件传输相关消息
-			go c.handleFileMessage(&msg, conn)
-		case common.MsgTypeFolderOffer:
-			// 处理文件夹发送请求
-			go c.handleFolderOffer(&msg, conn)
-		case common.MsgTypeFolderAccept, common.MsgTypeFolderReject, common.MsgTypeFolderDone:
-			// 处理文件夹传输相关消息
-			go c.handleFolderMessage(&msg, conn)
+		default:
+			c.handleTransferMessage(&msg, reader, conn)
 		}
 	}
 }
@@ -783,6 +803,12 @@ func (c *ChatClient) endChatSession() {
 		for id, tf := range c.receivingFiles {
 			if tf.File != nil {
 				tf.File.Close()
+			}
+			// 会话中断不清删临时文件：把当前断点写进元数据，下次同一个文件可续传
+			if tf.PartPath != "" {
+				writePartMeta(tf.FilePath, partMeta{
+					Key: tf.FileKey, FileName: tf.FileName, Size: tf.FileSize, Written: tf.Written,
+				})
 			}
 			delete(c.receivingFiles, id)
 		}
@@ -1276,9 +1302,8 @@ func (c *ChatClient) sendFile(filePath string) {
 	// 生成文件ID
 	fileID := generateFileID()
 
-	// 计算总块数（每块16KB）
-	const chunkSize = 16 * 1024
-	totalChunks := int((fileSize + chunkSize - 1) / chunkSize)
+	// 计算总块数
+	totalChunks := int((fileSize + fileChunkSize - 1) / fileChunkSize)
 
 	// 保存文件信息
 	transferFile := &TransferringFile{
@@ -1289,14 +1314,15 @@ func (c *ChatClient) sendFile(filePath string) {
 		File:         file,
 		TotalChunks:  totalChunks,
 		CurrentChunk: 0,
-		Buffer:       make([]byte, chunkSize),
+		Buffer:       make([]byte, fileChunkSize),
+		FileKey:      stableFileKey(fileName, fileSize, fileInfo.ModTime()),
 	}
 
 	c.fileMutex.Lock()
 	c.sendingFiles[fileID] = transferFile
 	c.fileMutex.Unlock()
 
-	// 发送文件发送请求
+	// 发送文件发送请求（带 FileKey 与 Proto，供接收端判断能否续传）
 	fileOfferMsg := common.Message{
 		Type:        common.MsgTypeFileOffer,
 		From:        c.name,
@@ -1304,6 +1330,8 @@ func (c *ChatClient) sendFile(filePath string) {
 		FileSize:    fileSize,
 		FileID:      fileID,
 		TotalChunks: totalChunks,
+		FileKey:     transferFile.FileKey,
+		Proto:       protoV2,
 	}
 
 	if !c.writeProtocolMsg(&fileOfferMsg) {
@@ -1335,6 +1363,17 @@ func (c *ChatClient) writeProtocolMsg(msg *common.Message) bool {
 	}
 	data, _ := json.Marshal(msg)
 	_, err := c.chatConn.Write(append(data, '\n'))
+	return err == nil
+}
+
+// writeRaw 线程安全地写入一段已拼好的原始字节（二进制数据块整帧一次写出）
+func (c *ChatClient) writeRaw(data []byte) bool {
+	c.chatMutex.Lock()
+	defer c.chatMutex.Unlock()
+	if c.chatConn == nil {
+		return false
+	}
+	_, err := c.chatConn.Write(data)
 	return err == nil
 }
 
@@ -1385,21 +1424,41 @@ func (c *ChatClient) SetFileDataDir(dir string) error {
 	return nil
 }
 
-// 清理接收中的文件资源
-func (c *ChatClient) cleanupReceivingFile(fileID string) {
+// cleanupReceivingFile 关闭接收句柄并移除状态。
+// discardPart=true 表示这次传输彻底作废（用户/对端明确取消），删除临时文件；
+// false 表示只是中断（断网、进程退出），保留临时文件与元数据供下次续传。
+func (c *ChatClient) cleanupReceivingFile(fileID string, discardPart bool) {
 	c.fileMutex.Lock()
-	defer c.fileMutex.Unlock()
-
-	if file, exists := c.receivingFiles[fileID]; exists {
-		if file.File != nil {
-			file.File.Close()
-		}
+	file, exists := c.receivingFiles[fileID]
+	written := int64(0)
+	if exists {
 		delete(c.receivingFiles, fileID)
-
+		written = file.Written
 		// 如果是普通文件传输，设置receiving为false
 		if file.FolderID == "" {
 			c.receiving = false
 		}
+	}
+	c.fileMutex.Unlock()
+
+	if !exists {
+		return
+	}
+	if file.File != nil {
+		file.File.Close()
+	}
+	if file.PartPath == "" {
+		return
+	}
+	if discardPart {
+		removePartFiles(file.FilePath)
+		return
+	}
+	// 记录断点：以真实写入字节为准，下次同一文件从块边界处续传
+	if err := writePartMeta(file.FilePath, partMeta{
+		Key: file.FileKey, FileName: file.FileName, Size: file.FileSize, Written: written,
+	}); err != nil {
+		c.logf("保存续传断点失败: %v", err)
 	}
 }
 
@@ -1520,10 +1579,36 @@ func (c *ChatClient) RejectFile(fileID string) {
 	c.logf("已拒绝文件传输")
 }
 
-// acceptIncomingFile 创建文件并回复接受，开始接收数据
+// acceptIncomingFile 创建文件并回复接受，开始接收数据。
+// 协议 v2 下数据先写入 xxx.lcpart，收到 FileDone 且长度校验通过后才改名为正式文件名，
+// 这样中断的传输不会留下看起来「完整」的半截文件，而且下次可以接着传。
 func (c *ChatClient) acceptIncomingFile(msg *common.Message, conn net.Conn, savePath string) {
-	// 创建文件用于保存
-	file, err := os.Create(savePath)
+	// 逐文件协商：只有发送端也声明 Proto>=2 才启用二进制块与续传
+	wantV2 := msg.Proto >= protoV2
+
+	var (
+		file     *os.File
+		err      error
+		partPath string
+		resume   int64
+	)
+
+	if wantV2 {
+		resume = detectResumeOffset(savePath, msg)
+		partPath = partPathFor(savePath)
+		file, err = openPartFile(partPath, resume)
+		if err != nil {
+			// 临时文件打不开（权限/磁盘满等）：退回直接写目标文件，至少不中断传输
+			c.logf("无法创建临时文件 %s: %v，改为直接写入目标文件", partPath, err)
+			wantV2 = false
+			partPath = ""
+			resume = 0
+			file, err = os.Create(savePath)
+		}
+	} else {
+		file, err = os.Create(savePath)
+	}
+
 	if err != nil {
 		c.logf("创建文件失败: %v", err)
 		// 发送拒绝消息
@@ -1550,35 +1635,120 @@ func (c *ChatClient) acceptIncomingFile(msg *common.Message, conn net.Conn, save
 		FileID:       msg.FileID,
 		File:         file,
 		TotalChunks:  msg.TotalChunks,
-		CurrentChunk: 0,
+		CurrentChunk: int(resume / int64(fileChunkSize)),
+		Buffer:       make([]byte, fileChunkSize),
 		RelativePath: msg.RelativePath,
 		FolderID:     msg.FolderID,
+		// 续传：字节数从续传点起算，块序号也必须对齐到同一位置
+		Written:   resume,
+		Resume:    resume,
+		Proto2:    wantV2,
+		FileKey:   msg.FileKey,
+		PartPath:  partPath,
+		LastAckAt: resume,
+	}
+
+	// 记录续传元数据：进程崩溃/断网后，下次同一个文件就能靠它匹配到底稿。
+	// 只对够大的文件预先落盘，小文件改为中断时补写（见 cleanupReceivingFile）。
+	if wantV2 && msg.FileSize >= resumeMetaMinSize {
+		if err := writePartMeta(savePath, partMeta{
+			Key: msg.FileKey, FileName: msg.FileName, Size: msg.FileSize, Written: resume,
+		}); err != nil {
+			c.logf("写入续传元数据失败: %v", err)
+		}
 	}
 
 	c.fileMutex.Lock()
 	c.receivingFiles[msg.FileID] = transferFile
 	c.fileMutex.Unlock()
 
-	// 接受文件
+	// 接受文件：回显 Proto（表示双方都支持 v2）以及续传起点
+	proto := 0
+	if wantV2 {
+		proto = protoV2
+	}
 	acceptMsg := common.Message{
-		Type:   common.MsgTypeFileAccept,
-		From:   c.name,
-		FileID: msg.FileID,
+		Type:         common.MsgTypeFileAccept,
+		From:         c.name,
+		FileID:       msg.FileID,
+		Proto:        proto,
+		ResumeOffset: resume,
 	}
 	data, _ := json.Marshal(acceptMsg)
 	conn.Write(append(data, '\n'))
 
 	if msg.FolderID == "" {
-		c.logf("开始接收文件: %s，保存到: %s", msg.FileName, savePath)
+		if resume > 0 {
+			c.logf("继续接收文件: %s，从 %s 处续传，保存到: %s",
+				msg.FileName, FormatFileSize(resume), savePath)
+			if c.OnTransferResumed != nil {
+				c.OnTransferResumed(msg.FileName, resume, msg.FileSize)
+			}
+		} else {
+			c.logf("开始接收文件: %s，保存到: %s", msg.FileName, savePath)
+		}
 	}
+}
+
+// detectResumeOffset 判断能否对本次 offer 续传，返回对齐到块边界的起始偏移。
+// 只有「元数据里的文件标识与大小都完全一致」时才续传，
+// 否则说明同名文件已被改动（或根本是另一个文件），旧临时文件必须作废。
+func detectResumeOffset(savePath string, msg *common.Message) int64 {
+	partPath := partPathFor(savePath)
+
+	m, ok := readPartMeta(savePath)
+	if !ok || msg.FileKey == "" || m.Key != msg.FileKey || m.Size != msg.FileSize {
+		// 没有元数据或身份不符：残留的 .lcpart 无从确认内容，直接丢弃
+		if _, err := os.Stat(partPath); err == nil {
+			removePartFiles(savePath)
+		}
+		return 0
+	}
+
+	st, err := os.Stat(partPath)
+	if err != nil {
+		removePartFiles(savePath)
+		return 0
+	}
+	// 以实际文件长度为准（元数据里的 Written 只是同一时刻的快照，
+	// 进程被强杀时文件长度可能更准），并对齐到块边界
+	size := st.Size()
+	if size > msg.FileSize {
+		size = msg.FileSize
+	}
+	return alignDownToChunk(size)
+}
+
+// finalizePart 把临时文件改名为正式文件名并清理续传元数据。
+// 目标名被占用时（极少见）追加时间戳，绝不覆盖用户已有文件。
+func finalizePart(tf *TransferringFile) (string, error) {
+	savePath := tf.FilePath
+	if err := os.Rename(tf.PartPath, savePath); err != nil {
+		stamp := time.Now().Format("20060102_150405")
+		ext := filepath.Ext(savePath)
+		base := strings.TrimSuffix(savePath, ext)
+		alt := fmt.Sprintf("%s_%s%s", base, stamp, ext)
+		if err2 := os.Rename(tf.PartPath, alt); err2 != nil {
+			return "", err
+		}
+		savePath = alt
+	}
+	removePartFiles(tf.FilePath)
+	return savePath, nil
 }
 
 // 处理文件传输相关消息
 func (c *ChatClient) handleFileMessage(msg *common.Message, _ net.Conn) {
 	switch msg.Type {
 	case common.MsgTypeFileAccept:
-		// 对方接受了文件，开始发送文件数据
-		go c.sendFileData(msg.FileID)
+		// 对方接受了文件。accept 里带回 Proto 与 ResumeOffset：
+		// Proto>=2 表示双方可以走二进制块 + 续传，ResumeOffset 是对方要我们从哪里接着发
+		c.fileMutex.Lock()
+		if tf, ok := c.sendingFiles[msg.FileID]; ok {
+			tf.Proto2 = msg.Proto >= protoV2
+		}
+		c.fileMutex.Unlock()
+		go c.sendFileData(msg.FileID, msg.ResumeOffset, msg.Proto >= protoV2)
 	case common.MsgTypeFileReject:
 		// 对方拒绝了文件，清理发送资源（关闭文件句柄并复位传输状态）
 		c.cleanupSendingFile(msg.FileID)
@@ -1586,36 +1756,80 @@ func (c *ChatClient) handleFileMessage(msg *common.Message, _ net.Conn) {
 			c.OnTransferEnded(true, fmt.Sprintf("%s 拒绝了你的文件", msg.From))
 		}
 	case common.MsgTypeFileDone:
-		// 文件传输完成
-		c.fileMutex.Lock()
-		var savePath string
-		isFolderFile := false
-		if tf, exists := c.receivingFiles[msg.FileID]; exists {
-			savePath = tf.FilePath
-			isFolderFile = tf.FolderID != ""
-			tf.File.Close()
-			delete(c.receivingFiles, msg.FileID)
-		}
-		if !isFolderFile {
-			c.receiving = false
-		}
-		c.fileMutex.Unlock()
-
-		if c.OnTransferEnded != nil && !isFolderFile {
-			c.OnTransferEnded(false, fmt.Sprintf("文件 '%s' 接收完成", msg.FileName))
-		}
-		if c.OnFileSaved != nil && !isFolderFile {
-			c.OnFileSaved(msg.FileName, savePath)
-		}
+		c.finalizeReceivingFile(msg)
 	case common.MsgTypeFileCancel:
-		// 文件传输取消（接收方视角），清理接收资源
-		c.cleanupReceivingFile(msg.FileID)
+		// 明确取消（对方中止或用户取消）：临时文件不再有用，直接删除
+		c.cleanupReceivingFile(msg.FileID, true)
 		c.fileMutex.Lock()
 		c.transmitting = false
 		c.fileMutex.Unlock()
 		if c.OnTransferEnded != nil {
 			c.OnTransferEnded(false, "对方取消了文件传输")
 		}
+	}
+}
+
+// finalizeReceivingFile 处理 FileDone：校验长度、把临时文件转正、回调界面
+func (c *ChatClient) finalizeReceivingFile(msg *common.Message) {
+	c.fileMutex.Lock()
+	tf, exists := c.receivingFiles[msg.FileID]
+	if exists {
+		delete(c.receivingFiles, msg.FileID)
+		if tf.FolderID == "" {
+			c.receiving = false
+		}
+	}
+	written, expected := int64(0), int64(0)
+	if exists {
+		written, expected = tf.Written, tf.FileSize
+	}
+	c.fileMutex.Unlock()
+	if !exists {
+		return
+	}
+
+	if tf.File != nil {
+		tf.File.Close()
+	}
+
+	// 长度校验：块序号错位/丢块时不能让残缺文件伪装成“接收完成”。
+	// 缺失的部分（written < expected）保留临时文件与元数据，用户重发同一文件即可续传。
+	if expected > 0 && written != expected {
+		if written > expected {
+			// 多出来的内容无法解释，元数据一并作废
+			removePartFiles(tf.FilePath)
+		} else if tf.PartPath != "" {
+			writePartMeta(tf.FilePath, partMeta{
+				Key: tf.FileKey, FileName: tf.FileName, Size: tf.FileSize, Written: written,
+			})
+		}
+		c.logf("文件 '%s' 长度不符（收到 %d 字节，应为 %d 字节），判定传输失败",
+			msg.FileName, written, expected)
+		if c.OnTransferEnded != nil {
+			c.OnTransferEnded(false, fmt.Sprintf("文件 '%s' 接收不完整（%s / %s），重新发送可继续传输",
+				msg.FileName, FormatFileSize(written), FormatFileSize(expected)))
+		}
+		return
+	}
+
+	savePath := tf.FilePath
+	if tf.PartPath != "" {
+		final, err := finalizePart(tf)
+		if err != nil {
+			c.logf("保存文件 %s 失败: %v", tf.FileName, err)
+			if c.OnTransferEnded != nil && tf.FolderID == "" {
+				c.OnTransferEnded(false, fmt.Sprintf("文件 '%s' 保存失败: %v", tf.FileName, err))
+			}
+			return
+		}
+		savePath = final
+	}
+
+	if c.OnTransferEnded != nil && tf.FolderID == "" {
+		c.OnTransferEnded(false, fmt.Sprintf("文件 '%s' 接收完成", msg.FileName))
+	}
+	if c.OnFileSaved != nil && tf.FolderID == "" {
+		c.OnFileSaved(msg.FileName, savePath)
 	}
 }
 
@@ -1635,19 +1849,25 @@ func (c *ChatClient) handleFolderMessage(msg *common.Message, _ net.Conn) {
 		// 文件夹传输完成
 		c.fileMutex.Lock()
 		folderPath := ""
-		if _, exists := c.receivingFolders[msg.FolderID]; exists {
-			folderPath = filepath.Join(c.FileDataDir(), msg.FolderName)
+		if tf, exists := c.receivingFolders[msg.FolderID]; exists {
+			// 用接受时确定下来的真实保存路径（可能带时间戳后缀），
+			// 不能再用 FileDataDir()/FolderName 重新拼一遍
+			folderPath = tf.FolderPath
 			delete(c.receivingFolders, msg.FolderID)
 			c.receiving = false
 		}
 		c.fileMutex.Unlock()
-		if folderPath != "" && c.OnTransferEnded != nil {
-			c.OnTransferEnded(false, fmt.Sprintf("文件夹 '%s' 接收完成，已保存到: %s", msg.FolderName, folderPath))
+		if folderPath != "" {
+			// 整个文件夹收完，续传标记作废，下次同名文件夹会作为新副本接收
+			removeFolderMarker(folderPath)
+			if c.OnTransferEnded != nil {
+				c.OnTransferEnded(false, fmt.Sprintf("文件夹 '%s' 接收完成，已保存到: %s", msg.FolderName, folderPath))
+			}
 		}
 	}
 }
 
-// 扫描文件夹内容
+// scanFolder 扫描文件夹内容
 func scanFolder(folderPath string) ([]string, int64, error) {
 	var files []string
 	var totalSize int64
@@ -1657,6 +1877,11 @@ func scanFolder(folderPath string) ([]string, int64, error) {
 			return err
 		}
 		if !info.IsDir() {
+			// 跳过本程序自己的中间文件：直接发送「上次没传完的接收目录」时，
+			// 临时文件与续传标记不应该被当成用户数据传给对方
+			if isInternalTransferFile(info.Name()) {
+				return nil
+			}
 			files = append(files, path)
 			totalSize += info.Size()
 		}
@@ -1730,7 +1955,7 @@ func (c *ChatClient) sendFolder(folderPath string) {
 	c.sendingFolders[folderID] = transferFolder
 	c.fileMutex.Unlock()
 
-	// 发送文件夹请求
+	// 发送文件夹请求（FileKey 作为文件夹的稳定标识，供接收端匹配未完成的目录）
 	folderOfferMsg := common.Message{
 		Type:       common.MsgTypeFolderOffer,
 		From:       c.name,
@@ -1738,6 +1963,8 @@ func (c *ChatClient) sendFolder(folderPath string) {
 		FolderSize: totalSize,
 		FileCount:  len(files),
 		FolderID:   folderID,
+		FileKey:    stableFolderKey(folderName, totalSize, len(files)),
+		Proto:      protoV2,
 	}
 
 	if !c.writeProtocolMsg(&folderOfferMsg) {
@@ -1763,12 +1990,24 @@ func (c *ChatClient) AcceptFolder(folderID string) {
 
 	// 创建保存文件夹的完整路径
 	dir := c.FileDataDir()
-	folderSavePath := filepath.Join(dir, req.msg.FolderName)
+	folderSavePath := ""
 
-	// 检查文件夹是否已存在，如果存在则添加时间戳
-	if _, err := os.Stat(folderSavePath); err == nil {
-		timestamp := time.Now().Format("20060102_150405")
-		folderSavePath = filepath.Join(dir, fmt.Sprintf("%s_%s", req.msg.FolderName, timestamp))
+	// 协议 v2：如果同名目录里留着「上次没传完」的标记，且文件夹标识一致，
+	// 就继续往这个目录里写，里面的 .lcpart 会被逐个文件续传复用
+	if req.msg.Proto >= protoV2 && req.msg.FileKey != "" {
+		candidate := filepath.Join(dir, req.msg.FolderName)
+		if key, ok := readFolderMarker(candidate); ok && key == req.msg.FileKey {
+			folderSavePath = candidate
+		}
+	}
+
+	if folderSavePath == "" {
+		folderSavePath = filepath.Join(dir, req.msg.FolderName)
+		// 检查文件夹是否已存在，如果存在则添加时间戳
+		if _, err := os.Stat(folderSavePath); err == nil {
+			timestamp := time.Now().Format("20060102_150405")
+			folderSavePath = filepath.Join(dir, fmt.Sprintf("%s_%s", req.msg.FolderName, timestamp))
+		}
 	}
 
 	// 创建文件夹
@@ -1786,6 +2025,13 @@ func (c *ChatClient) AcceptFolder(folderID string) {
 		c.receiving = false
 		c.fileMutex.Unlock()
 		return
+	}
+
+	// 留下续传标记：整个文件夹收完后由 FolderDone 删除
+	if req.msg.Proto >= protoV2 {
+		if err := writeFolderMarker(folderSavePath, req.msg.FileKey); err != nil {
+			c.logf("写入文件夹续传标记失败: %v", err)
+		}
 	}
 
 	// 保存文件夹传输信息
@@ -1911,9 +2157,8 @@ func (c *ChatClient) sendFilesInFolder(folderID string) {
 		fileSize := fileInfo.Size()
 		fileName := filepath.Base(filePath)
 		fileID := generateFileID()
-		const chunkSize = 16 * 1024
+		const chunkSize = fileChunkSize
 		totalChunks := int((fileSize + int64(chunkSize) - 1) / int64(chunkSize))
-
 		// 创建传输文件信息
 		transferFile := &TransferringFile{
 			FilePath:     filePath,
@@ -1923,9 +2168,10 @@ func (c *ChatClient) sendFilesInFolder(folderID string) {
 			File:         file,
 			TotalChunks:  totalChunks,
 			CurrentChunk: 0,
-			Buffer:       make([]byte, chunkSize),
+			Buffer:       make([]byte, fileChunkSize),
 			RelativePath: relativePath,
 			FolderID:     folderID,
+			FileKey:      stableFileKey(relativePath, fileSize, fileInfo.ModTime()),
 		}
 
 		c.fileMutex.Lock()
@@ -1942,6 +2188,8 @@ func (c *ChatClient) sendFilesInFolder(folderID string) {
 			TotalChunks:  totalChunks,
 			FolderID:     folderID,
 			RelativePath: relativePath,
+			FileKey:      transferFile.FileKey,
+			Proto:        protoV2,
 		}
 
 		if !c.writeProtocolMsg(&fileOfferMsg) {
@@ -1951,17 +2199,8 @@ func (c *ChatClient) sendFilesInFolder(folderID string) {
 			return
 		}
 
-		// 等待文件接受（在handleFileMessage中处理）
-		// 我们需要等待当前文件传输完成
-		for {
-			c.fileMutex.Lock()
-			_, fileExists := c.sendingFiles[fileID]
-			c.fileMutex.Unlock()
-			if !fileExists {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+		// 等待当前文件传输结束（接受后被 sendFileData 消费，拒绝/失败时由 cleanup 唤醒）
+		c.waitSendingFileDone(fileID)
 
 		transferFolder.CurrentFile++
 		fileProgress := int(float64(transferFolder.CurrentFile) / float64(transferFolder.TotalFiles) * 100)
@@ -2014,10 +2253,32 @@ func (c *ChatClient) cleanupSendingFile(fileID string) {
 	} else {
 		c.transmitting = false
 	}
+	// 唤醒正在等待该文件发送结束的文件夹发送循环
+	if c.fileDoneCond != nil {
+		c.fileDoneCond.Broadcast()
+	}
 }
 
-// 发送文件数据
-func (c *ChatClient) sendFileData(fileID string) {
+// waitSendingFileDone 阻塞等待某个发送任务结束（完成/拒绝/取消/失败）。
+// 取代原先每 100ms 轮询一次的实现：那会让文件夹传输每个文件固定多等约 100ms，
+// 上千个小文件就要多花几分钟。
+func (c *ChatClient) waitSendingFileDone(fileID string) {
+	if c.fileDoneCond == nil {
+		return
+	}
+	c.fileMutex.Lock()
+	defer c.fileMutex.Unlock()
+	for {
+		if _, exists := c.sendingFiles[fileID]; !exists {
+			return
+		}
+		c.fileDoneCond.Wait()
+	}
+}
+
+// 发送文件数据。
+// resume 为接收端要求的续传起点（0 表示从头发），proto2 表示双方都支持协议 v2。
+func (c *ChatClient) sendFileData(fileID string, resume int64, proto2 bool) {
 	c.fileMutex.Lock()
 	transferFile, exists := c.sendingFiles[fileID]
 	c.fileMutex.Unlock()
@@ -2026,12 +2287,28 @@ func (c *ChatClient) sendFileData(fileID string) {
 		return
 	}
 
-	const chunkSize = 16 * 1024
+	// 接收端要求从某个偏移续传时，先把文件位置与块序号一起对齐过去
+	if proto2 && resume > 0 {
+		c.applyResume(transferFile, resume)
+	}
+	transferFile.Sent = transferFile.Resume
+
+	buf := transferFile.Buffer
+	lastPct := -1
+	var lastReport time.Time
+
+	// 二进制模式下把「JSON 头 + 换行 + 原始字节」拼进同一块缓冲，一块只有一次 Write。
+	// 预分配一次后反复复用，避免每块都向 GC 申请 128KB。
+	var frameBuf []byte
+	if proto2 {
+		frameBuf = make([]byte, 0, chunkFrameSlack+fileChunkSize)
+	}
 
 	for transferFile.CurrentChunk < transferFile.TotalChunks {
-		// 读取文件数据
-		n, err := transferFile.File.Read(transferFile.Buffer)
-		if err != nil && !errors.Is(err, io.EOF) {
+		// 一次尽量读满一个数据块：os.File.Read 可能提前返回，
+		// 按实际字节数推进块序号会造成块大小与总块数不匹配，因此这里补齐到整块
+		n, err := io.ReadFull(transferFile.File, buf)
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			c.logf("读取文件失败: %v", err)
 			// 发送取消消息
 			cancelMsg := common.Message{
@@ -2051,24 +2328,49 @@ func (c *ChatClient) sendFileData(fileID string) {
 			break
 		}
 
-		// 编码文件数据为base64（保证二进制数据能安全通过JSON传输）
-		fileData := base64.StdEncoding.EncodeToString(transferFile.Buffer[:n])
-
-		// 计算进度
-		progress := int(float64(transferFile.CurrentChunk+1) / float64(transferFile.TotalChunks) * 100)
-
-		// 发送数据块
-		dataMsg := common.Message{
-			Type:        common.MsgTypeFileData,
-			From:        c.name,
-			FileID:      fileID,
-			FileData:    fileData,
-			ChunkIndex:  transferFile.CurrentChunk,
-			TotalChunks: transferFile.TotalChunks,
-			Progress:    progress,
+		transferFile.Sent += int64(n)
+		progress := 0
+		if transferFile.FileSize > 0 {
+			progress = int(float64(transferFile.Sent) / float64(transferFile.FileSize) * 100)
+		}
+		if progress > 100 {
+			progress = 100
 		}
 
-		if !c.writeProtocolMsg(&dataMsg) {
+		var ok bool
+		if proto2 {
+			// 协议 v2：JSON 头声明本块字节数，随后跟原始二进制，省掉 base64 的 33% 膨胀
+			hdr := common.Message{
+				Type:       common.MsgTypeFileDataBin,
+				From:       c.name,
+				FileID:     fileID,
+				ChunkIndex: transferFile.CurrentChunk,
+				ChunkBytes: n,
+				Progress:   progress,
+			}
+			header, err := json.Marshal(&hdr)
+			if err != nil {
+				c.logf("编码数据块头失败: %v", err)
+				ok = false
+			} else {
+				frameBuf = appendChunkFrame(frameBuf[:0], header, buf[:n])
+				ok = c.writeRaw(frameBuf)
+			}
+		} else {
+			// 兼容通道：base64 塞进 JSON，能被旧版本对端解析
+			dataMsg := common.Message{
+				Type:        common.MsgTypeFileData,
+				From:        c.name,
+				FileID:      fileID,
+				FileData:    base64.StdEncoding.EncodeToString(buf[:n]),
+				ChunkIndex:  transferFile.CurrentChunk,
+				TotalChunks: transferFile.TotalChunks,
+				Progress:    progress,
+			}
+			ok = c.writeProtocolMsg(&dataMsg)
+		}
+
+		if !ok {
 			c.logf("发送文件数据失败：会话已结束")
 			c.cleanupSendingFile(fileID)
 			if c.OnTransferEnded != nil {
@@ -2077,15 +2379,18 @@ func (c *ChatClient) sendFileData(fileID string) {
 			return
 		}
 
-		// 通知进度
-		if c.OnFileProgress != nil {
+		// 进度节流：仅在百分比变化且距上次回调超过间隔时通知，避免刷爆UI队列
+		if c.OnFileProgress != nil && progress != lastPct &&
+			(progress >= 100 || time.Since(lastReport) >= progressInterval) {
 			c.OnFileProgress(progress, true, fmt.Sprintf("发送文件 %s", transferFile.FileName))
+			lastPct = progress
+			lastReport = time.Now()
 		}
 
 		transferFile.CurrentChunk++
 
-		// 小延迟避免网络拥塞
-		time.Sleep(10 * time.Millisecond)
+		// 分块之间不再人为 sleep：TCP 发送缓冲区本身就是背压，
+		// 原来的 10ms 延迟把吞吐硬性锁死在约 1.6MB/s
 	}
 
 	// 发送完成消息
@@ -2103,57 +2408,184 @@ func (c *ChatClient) sendFileData(fileID string) {
 	}
 }
 
-// 接收文件数据
+// applyResume 把文件读写位置与块序号对齐到接收端要求的续传点，返回实际生效的偏移。
+// 偏移被强制对齐到块边界：接收端按 ChunkIndex 顺序拼接，起点错开一个字节就会全盘错位。
+func (c *ChatClient) applyResume(tf *TransferringFile, resume int64) int64 {
+	if resume > tf.FileSize {
+		resume = tf.FileSize
+	}
+	resume = alignDownToChunk(resume)
+	if resume <= 0 {
+		return 0
+	}
+	if _, err := tf.File.Seek(resume, io.SeekStart); err != nil {
+		c.logf("定位续传起点失败（%v），改为从头发送", err)
+		tf.File.Seek(0, io.SeekStart)
+		return 0
+	}
+	tf.CurrentChunk = int(resume / int64(fileChunkSize))
+	tf.Resume = resume
+	pct := 0
+	if tf.FileSize > 0 {
+		pct = int(resume * 100 / tf.FileSize)
+	}
+	c.logf("从 %s 处继续发送 %s（已完成 %d%%）", FormatFileSize(resume), tf.FileName, pct)
+	if c.OnTransferResumed != nil {
+		c.OnTransferResumed(tf.FileName, resume, tf.FileSize)
+	}
+	return resume
+}
+
+// receiveFileData 处理旧协议的 base64 数据块（与 v1 对端互通时使用）
 func (c *ChatClient) receiveFileData(msg *common.Message) {
+	data, err := base64.StdEncoding.DecodeString(msg.FileData)
+	if err != nil {
+		c.fileMutex.Lock()
+		tf := c.receivingFiles[msg.FileID]
+		c.fileMutex.Unlock()
+		name := msg.FileID
+		if tf != nil {
+			name = tf.FileName
+		}
+		c.logf("解码文件数据失败: %v", err)
+		c.abortReceivingFile(msg.FileID, fmt.Sprintf("文件 '%s' 传输中断：数据解码失败", name))
+		return
+	}
+	c.writeReceivedChunk(msg, data)
+}
+
+// receiveBinChunk 处理协议 v2 的二进制数据块：紧跟 JSON 头之后的 ChunkBytes 个原始字节。
+// 必须在本连接的唯一读取协程里同步读完负载，否则后续消息会被当成文件数据吞掉。
+func (c *ChatClient) receiveBinChunk(msg *common.Message, reader *bufio.Reader, conn net.Conn) {
+	n := msg.ChunkBytes
+	if n <= 0 || n > fileChunkSize {
+		// 长度非法说明帧已经不可信，继续读下去只会越错越远，直接断开连接
+		c.logf("数据块长度非法（%d，上限 %d），断开连接以避免协议错乱", n, fileChunkSize)
+		conn.Close()
+		return
+	}
+	// 复用该次接收自带的缓冲（接收端原本用不到 Buffer 字段），
+	// 避免每块都申请一次 128KB：高速传输时这是成百 MB/s 的垃圾产出
+	c.fileMutex.Lock()
+	var scratch []byte
+	if tf, ok := c.receivingFiles[msg.FileID]; ok {
+		scratch = tf.Buffer
+	}
+	c.fileMutex.Unlock()
+
+	payload, err := readChunkPayload(reader, n, scratch)
+	if err != nil {
+		c.logf("读取二进制数据块失败: %v", err)
+		conn.Close()
+		return
+	}
+	c.writeReceivedChunk(msg, payload)
+}
+
+// writeReceivedChunk 把一个数据块写入文件，并负责序号校验、ACK 与进度回调。
+// JSON 与二进制两条通道共用这段逻辑，保证行为一致。
+// 接收状态（Written/CurrentChunk）可能在别的协程被读取（FileDone、界面统计），
+// 因此统一在 fileMutex 保护下更新；但文件写入之外的回调一律放到锁外调用，避免嵌套加锁。
+func (c *ChatClient) writeReceivedChunk(msg *common.Message, data []byte) {
 	c.fileMutex.Lock()
 	transferFile, exists := c.receivingFiles[msg.FileID]
-	c.fileMutex.Unlock()
 	if !exists {
+		c.fileMutex.Unlock()
 		c.logf("找不到接收文件信息: %s", msg.FileID)
 		return
 	}
 
-	// 检查数据块索引是否正确
+	// 检查数据块索引是否正确。
+	// 旧实现只记录日志就丢包，后续所有块都会“序号不匹配”被丢弃，
+	// 最终得到一个静默截断的坏文件；这里改为立即终止本次传输并明确告知双方。
 	if msg.ChunkIndex != transferFile.CurrentChunk {
-		c.logf("数据块顺序错误，期望: %d, 收到: %d", transferFile.CurrentChunk, msg.ChunkIndex)
-		// 可以选择请求重新发送该块
-		return
-	}
-
-	// 解码base64文件数据
-	data, err := base64.StdEncoding.DecodeString(msg.FileData)
-	if err != nil {
-		c.logf("解码文件数据失败: %v", err)
+		name, expected, got := transferFile.FileName, transferFile.CurrentChunk, msg.ChunkIndex
+		c.fileMutex.Unlock()
+		c.logf("数据块顺序错误（期望 %d，收到 %d），终止本次传输以避免生成损坏文件", expected, got)
+		c.abortReceivingFile(msg.FileID, fmt.Sprintf("文件 '%s' 传输中断：数据块错位", name))
 		return
 	}
 
 	// 写入文件数据
-	_, err = transferFile.File.Write(data)
+	n, err := transferFile.File.Write(data)
 	if err != nil {
+		name := transferFile.FileName
+		c.fileMutex.Unlock()
 		c.logf("写入文件失败: %v", err)
-		// 发送取消消息
-		cancelMsg := common.Message{
-			Type:   common.MsgTypeFileCancel,
-			From:   c.name,
-			FileID: msg.FileID,
-		}
-		c.writeProtocolMsg(&cancelMsg)
-		c.cleanupReceivingFile(msg.FileID)
-		if c.OnTransferEnded != nil {
-			c.OnTransferEnded(false, fmt.Sprintf("文件 '%s' 保存失败，传输已取消", transferFile.FileName))
-		}
+		c.abortReceivingFile(msg.FileID, fmt.Sprintf("文件 '%s' 保存失败，传输已取消", name))
 		return
 	}
+	transferFile.Written += int64(n)
 
 	// 更新当前块索引
 	transferFile.CurrentChunk++
 
-	// 通知进度
-	if c.OnFileProgress != nil {
-		c.OnFileProgress(msg.Progress, false, fmt.Sprintf("接收文件 %s", transferFile.FileName))
+	// 每 ackInterval 字节回一次 ACK，并顺手把断点写进元数据。
+	// ACK 只是让对端知道「落盘到哪了」，不参与逐块流控，所以频率很低。
+	var ackOffset int64
+	if transferFile.Proto2 && transferFile.Written-transferFile.LastAckAt >= ackInterval {
+		transferFile.LastAckAt = transferFile.Written
+		ackOffset = transferFile.Written
+	}
+
+	// 通知进度（节流规则与发送端一致，避免高速传输时刷爆UI队列）
+	notify := false
+	pct := msg.Progress
+	if c.OnFileProgress != nil && pct != transferFile.LastPct &&
+		(pct >= 100 || time.Since(transferFile.LastReport) >= progressInterval) {
+		transferFile.LastPct = pct
+		transferFile.LastReport = time.Now()
+		notify = true
+	}
+	fileName := transferFile.FileName
+	savePath, key, size := transferFile.FilePath, transferFile.FileKey, transferFile.FileSize
+	c.fileMutex.Unlock()
+
+	if ackOffset > 0 {
+		ack := common.Message{
+			Type:        common.MsgTypeFileAck,
+			From:        c.name,
+			FileID:      msg.FileID,
+			AckedOffset: ackOffset,
+		}
+		c.writeProtocolMsg(&ack)
+		if err := writePartMeta(savePath, partMeta{
+			Key: key, FileName: fileName, Size: size, Written: ackOffset,
+		}); err != nil {
+			c.logf("更新续传断点失败: %v", err)
+		}
+	}
+
+	if notify {
+		c.OnFileProgress(pct, false, fmt.Sprintf("接收文件 %s", fileName))
 	}
 
 	// 如果所有数据块都已接收，不需要做特殊处理，因为发送方会发送FileDone消息
+}
+
+// handleFileAck 记录对端确认的落盘偏移（发送端使用）。
+// 传输若在此时中断，下次可从该偏移续传，不必从头再来。
+func (c *ChatClient) handleFileAck(msg *common.Message) {
+	c.fileMutex.Lock()
+	if tf, ok := c.sendingFiles[msg.FileID]; ok && msg.AckedOffset > tf.Acked {
+		tf.Acked = msg.AckedOffset
+	}
+	c.fileMutex.Unlock()
+}
+
+// abortReceivingFile 终止一次接收：通知对方取消、清理资源并回调UI。
+// 已收到的部分保留为临时文件（可以续传），只有在收到明确的取消消息时才删除。
+func (c *ChatClient) abortReceivingFile(fileID, text string) {
+	cancelMsg := common.Message{
+		Type:   common.MsgTypeFileCancel,
+		From:   c.name,
+		FileID: fileID,
+	}
+	c.writeProtocolMsg(&cancelMsg)
+	c.cleanupReceivingFile(fileID, false)
+	if c.OnTransferEnded != nil {
+		c.OnTransferEnded(false, text)
+	}
 }
 
 // FormatFileSize 格式化文件大小

@@ -302,6 +302,14 @@ func (ui *ChatUI) bindCallbacks() {
 		ui.uiDo(func() { ui.updateProgress(pct, label) })
 	}
 
+	// 断点续传开始：在进度条上方留下一条提示，用户能看到不是从头再传
+	c.OnTransferResumed = func(fileName string, offset, total int64) {
+		ui.uiDo(func() {
+			ui.appendLog(fmt.Sprintf("检测到未完成的传输，从 %s / %s 处继续：%s",
+				types.FormatFileSize(offset), types.FormatFileSize(total), fileName))
+		})
+	}
+
 	c.OnTransferEnded = func(sending bool, text string) {
 		ui.uiDo(func() {
 			ui.endProgress()

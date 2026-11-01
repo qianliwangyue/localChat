@@ -19,7 +19,9 @@ const (
 	MsgTypeFileOffer    = "file_offer"    // 文件发送请求
 	MsgTypeFileAccept   = "file_accept"   // 接受文件
 	MsgTypeFileReject   = "file_reject"   // 拒绝文件
-	MsgTypeFileData     = "file_data"     // 文件数据
+	MsgTypeFileData     = "file_data"     // 文件数据（base64，兼容旧对端）
+	MsgTypeFileDataBin  = "file_data_bin" // 文件数据（二进制帧：JSON头+\n+原始字节，protov2）
+	MsgTypeFileAck      = "file_ack"      // 数据块确认（protov2，用于断点续传记账）
 	MsgTypeFileDone     = "file_done"     // 文件传输完成
 	MsgTypeFileCancel   = "file_cancel"   // 取消文件传输
 	MsgTypeFolderOffer  = "folder_offer"  // 文件夹发送请求
@@ -49,6 +51,13 @@ type Message struct {
 	FileCount    int    `json:"fileCount,omitempty"`    // 文件数量
 	RelativePath string `json:"relativePath,omitempty"` // 相对路径
 	FolderID     string `json:"folderID,omitempty"`     // 文件夹唯一标识
+
+	// 协议 v2（二进制分帧 + 断点续传）
+	Proto        int    `json:"proto,omitempty"`        // 协议版本：>=2 表示支持二进制块与续传
+	FileKey      string `json:"fileKey,omitempty"`      // 稳定的文件标识，用于续传匹配
+	ResumeOffset int64  `json:"resumeOffset,omitempty"` // 接收端告知的续传起点（字节）
+	AckedOffset  int64  `json:"ackedOffset,omitempty"`  // ACK 消息中已确认落盘的字节数
+	ChunkBytes   int    `json:"chunkBytes,omitempty"`   // 二进制数据块头中本块的实际字节数
 }
 
 // Peer 对等节点信息
