@@ -9,8 +9,8 @@ import (
 )
 
 var (
-	//go:embed fonts/HYQingZhouXingJ-2.ttf
-	NotoSansSC []byte
+	//go:embed fonts/localcp-kai.ttf
+	uiFont []byte
 )
 
 // 现代化配色：靛蓝品牌色 + 柔和的中性灰背景，同时适配浅色/深色两种模式。
@@ -69,11 +69,12 @@ type MyTheme struct{}
 
 var _ fyne.Theme = (*MyTheme)(nil)
 
-// Font StaticName 为 fonts 目录下的 ttf 类型的字体文件名
+// Font 全局使用「汉仪欧楷」，呈现楷书手写的观感；
+// 该字体没有独立的粗体字重，层级差异靠字号与颜色区分。
 func (m MyTheme) Font(fyne.TextStyle) fyne.Resource {
 	return &fyne.StaticResource{
-		StaticName:    "HYQingZhouXingJ-2.ttf",
-		StaticContent: NotoSansSC,
+		StaticName:    "hanyiokaiu.ttf",
+		StaticContent: uiFont,
 	}
 }
 

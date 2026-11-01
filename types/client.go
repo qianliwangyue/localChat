@@ -10,6 +10,7 @@ import (
 	"localchat/pkg/common"
 	"sync/atomic"
 
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -52,6 +53,7 @@ type ChatClient struct {
 	transmitting bool
 	receiving    bool
 	fileDataDir  string
+	dirMutex     sync.RWMutex // 保护 fileDataDir（运行期可由设置页修改）
 	// 传输中的文件映射
 	sendingFiles   map[string]*TransferringFile // fileID -> 文件信息
 	receivingFiles map[string]*TransferringFile // fileID -> 文件信息
@@ -78,9 +80,10 @@ type ChatClient struct {
 
 func NewChatClient() *ChatClient {
 	// 创建文件保存目录
-	dataDir := "received_files"
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		os.Mkdir(dataDir, 0755)
+	// 打包为 MSIX（商店应用）时安装目录是只读的，resolveDataDir 会自动回退到用户文档目录
+	dataDir := resolveDataDir()
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		log.Printf("创建接收目录失败 %s: %v", dataDir, err)
 	}
 
 	client := &ChatClient{
@@ -101,6 +104,34 @@ func NewChatClient() *ChatClient {
 	}
 	client.online.Store(true)
 	return client
+}
+
+// resolveDataDir 决定接收文件的保存目录。
+// 免安装/开发运行时优先用当前目录下的 received_files（保持原有行为）；
+// MSIX 打包后安装目录只读，写探测失败时回退到“我的文档\LoacalCP\received_files”。
+func resolveDataDir() string {
+	const rel = "received_files"
+	if err := os.MkdirAll(rel, 0755); err == nil {
+		probe := filepath.Join(rel, ".write_probe")
+		if f, err := os.Create(probe); err == nil {
+			f.Close()
+			os.Remove(probe)
+			return rel
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		p := filepath.Join(home, "Documents", "LoacalCP", "received_files")
+		if err := os.MkdirAll(p, 0755); err == nil {
+			return p
+		}
+	}
+	if cfg, err := os.UserConfigDir(); err == nil && cfg != "" {
+		p := filepath.Join(cfg, "LoacalCP", "received_files")
+		if err := os.MkdirAll(p, 0755); err == nil {
+			return p
+		}
+	}
+	return rel
 }
 
 // peerKeyOf 生成用户唯一身份键（IP:TCP端口）。代号可以重复，网络端点才是唯一身份
@@ -1324,7 +1355,34 @@ func (c *ChatClient) UDPPort() int {
 
 // FileDataDir 获取接收文件的保存目录
 func (c *ChatClient) FileDataDir() string {
+	c.dirMutex.RLock()
+	defer c.dirMutex.RUnlock()
 	return c.fileDataDir
+}
+
+// SetFileDataDir 修改接收文件的保存目录。
+// 目录不存在时自动创建，并做一次写探测，确保后续接收文件不会因权限问题失败。
+// 修改立即生效，不影响正在进行的传输（已打开的写入路径保持不变）。
+func (c *ChatClient) SetFileDataDir(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return fmt.Errorf("保存位置不能为空")
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("无法创建目录: %w", err)
+	}
+	probe := filepath.Join(dir, ".write_probe")
+	f, err := os.Create(probe)
+	if err != nil {
+		return fmt.Errorf("目录不可写: %w", err)
+	}
+	f.Close()
+	os.Remove(probe)
+
+	c.dirMutex.Lock()
+	c.fileDataDir = dir
+	c.dirMutex.Unlock()
+	return nil
 }
 
 // 清理接收中的文件资源
@@ -1420,14 +1478,15 @@ func (c *ChatClient) AcceptFile(fileID string) {
 	}
 
 	// 创建保存文件的完整路径
-	savePath := filepath.Join(c.fileDataDir, req.msg.FileName)
+	dir := c.FileDataDir() // 一次性取值，避免改名过程中路径分裂到两个目录
+	savePath := filepath.Join(dir, req.msg.FileName)
 
 	// 检查文件是否已存在，如果存在则添加时间戳
 	if _, err := os.Stat(savePath); err == nil {
 		timestamp := time.Now().Format("20060102_150405")
 		ext := filepath.Ext(req.msg.FileName)
 		baseName := strings.TrimSuffix(req.msg.FileName, ext)
-		savePath = filepath.Join(c.fileDataDir, fmt.Sprintf("%s_%s%s", baseName, timestamp, ext))
+		savePath = filepath.Join(dir, fmt.Sprintf("%s_%s%s", baseName, timestamp, ext))
 	}
 
 	c.acceptIncomingFile(req.msg, req.conn, savePath)
@@ -1577,7 +1636,7 @@ func (c *ChatClient) handleFolderMessage(msg *common.Message, _ net.Conn) {
 		c.fileMutex.Lock()
 		folderPath := ""
 		if _, exists := c.receivingFolders[msg.FolderID]; exists {
-			folderPath = filepath.Join(c.fileDataDir, msg.FolderName)
+			folderPath = filepath.Join(c.FileDataDir(), msg.FolderName)
 			delete(c.receivingFolders, msg.FolderID)
 			c.receiving = false
 		}
@@ -1703,12 +1762,13 @@ func (c *ChatClient) AcceptFolder(folderID string) {
 	}
 
 	// 创建保存文件夹的完整路径
-	folderSavePath := filepath.Join(c.fileDataDir, req.msg.FolderName)
+	dir := c.FileDataDir()
+	folderSavePath := filepath.Join(dir, req.msg.FolderName)
 
 	// 检查文件夹是否已存在，如果存在则添加时间戳
 	if _, err := os.Stat(folderSavePath); err == nil {
 		timestamp := time.Now().Format("20060102_150405")
-		folderSavePath = filepath.Join(c.fileDataDir, fmt.Sprintf("%s_%s", req.msg.FolderName, timestamp))
+		folderSavePath = filepath.Join(dir, fmt.Sprintf("%s_%s", req.msg.FolderName, timestamp))
 	}
 
 	// 创建文件夹

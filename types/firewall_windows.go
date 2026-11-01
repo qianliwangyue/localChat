@@ -37,11 +37,14 @@ func (c *ChatClient) ensureFirewallRule() {
 		"protocol=UDP", fmt.Sprintf("localport=%d-%d", udpStart, udpStart+99))
 
 	if errTCP != nil || errUDP != nil {
-		c.logf("[重要] 未检测到防火墙入站放行规则，且当前无管理员权限无法自动添加。")
-		c.logf("其他机器将无法连接本机（表现为连接超时i/o timeout，本机往外连不受影响）。")
-		c.logf("修复方法(二选一)：1) 以管理员身份运行一次本程序自动配置；2) 管理员CMD执行：")
-		c.logf("netsh advfirewall firewall add rule name=%s dir=in action=allow profile=any protocol=TCP localport=%d-%d",
-			firewallRuleName, tcpStart, tcpStart+99)
+		// c.logf("[重要提示:]")
+		// c.logf("	未检测到防火墙入站放行规则，且当前无管理员权限无法自动添加。")
+		// c.logf("	如果其他机器无法连接本机（表现为连接超时i/o timeout，本机往外连不受影响）。")
+		// c.logf("	修复方法(二选一)：")
+		// c.logf("	1) 以管理员身份运行一次本程序自动配置；")
+		// c.logf("	2) 管理员CMD执行：")
+		// c.logf("netsh advfirewall firewall add rule name=%s dir=in action=allow profile=any protocol=TCP localport=%d-%d",
+		// 	firewallRuleName, tcpStart, tcpStart+99)
 		return
 	}
 	c.logf("已自动添加防火墙入站放行规则[%s]：TCP %d-%d / UDP %d-%d（所有网络配置文件）",

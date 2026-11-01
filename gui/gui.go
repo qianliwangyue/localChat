@@ -24,6 +24,7 @@ import (
 type ChatUI struct {
 	win    fyne.Window
 	client *types.ChatClient
+	prefs  fyne.Preferences // 偏好存储（接收目录等设置持久化；测试环境下可为 nil）
 
 	peers []common.Peer // 在线用户快照
 
@@ -37,10 +38,13 @@ type ChatUI struct {
 	sendFolderBtn *widget.Button
 	endChatBtn    *widget.Button
 
-	peerCount  *widget.Label    // 在线人数
-	emptyHint  *widget.Label    // 用户列表为空时的占位提示
-	statusDot  *canvas.Circle   // 聊天标题旁的状态点
-	headerInfo *widget.RichText // 顶部栏本机信息（小字）
+	peerCount   *widget.Label    // 在线人数
+	emptyHint   *widget.Label    // 用户列表为空时的占位提示
+	statusDot   *canvas.Circle   // 聊天标题旁的状态点
+	headerInfo  *widget.RichText // 顶部栏本机信息（小字）
+	settingsBtn *widget.Button   // 左下角设置入口
+
+	pendingDirWarning string // 启动时接收目录回退的提示，等主界面就绪后再写入日志
 
 	// 传输进度对话框
 	progressDlg   *dialog.ProgressDialog
@@ -107,6 +111,9 @@ func brandLogo(size float32) fyne.CanvasObject {
 	return container.NewGridWrap(fyne.NewSize(size, size), logo)
 }
 
+// prefKeyReceiveDir 接收文件保存位置的偏好键
+const prefKeyReceiveDir = "receiveDir"
+
 // Run 启动图形界面应用
 func Run() {
 	a := app.New()
@@ -115,7 +122,7 @@ func Run() {
 	w.Resize(fyne.NewSize(480, 540))
 	w.SetMaster()
 
-	ui := &ChatUI{win: w}
+	ui := &ChatUI{win: w, prefs: a.Preferences()}
 	ui.showNameSetup()
 	w.ShowAndRun()
 }
@@ -190,10 +197,22 @@ func (ui *ChatUI) startClient(name string) {
 
 	client := types.NewChatClient()
 	client.SetName(name)
+	// 应用上次在设置页选择的接收目录（无效则沿用默认目录）
+	if ui.prefs != nil {
+		if dir := strings.TrimSpace(ui.prefs.String(prefKeyReceiveDir)); dir != "" {
+			if err := client.SetFileDataDir(dir); err != nil {
+				ui.pendingDirWarning = fmt.Sprintf("上次设置的接收目录不可用（%v），已改用默认目录", err)
+			}
+		}
+	}
 	ui.client = client
 	ui.bindCallbacks()
 	client.Start()
 	ui.showMainUI()
+	if ui.pendingDirWarning != "" {
+		ui.appendLog("[系统] " + ui.pendingDirWarning)
+		ui.pendingDirWarning = ""
+	}
 }
 
 // bindCallbacks 绑定客户端事件回调（所有UI更新通过uiDo切换到主线程，未就绪时忽略）
@@ -304,8 +323,7 @@ func (ui *ChatUI) showMainUI() {
 
 	// ===== 顶部栏：品牌 + 本机信息 =====
 	ui.headerInfo = widget.NewRichText(&widget.TextSegment{
-		Text: fmt.Sprintf("代号 %s    IP %s    TCP端口 %d    接收目录 %s",
-			ui.client.GetName(), ui.client.LocalIP(), ui.client.TCPPort(), ui.client.FileDataDir()),
+		Text: ui.headerInfoText(),
 		Style: widget.RichTextStyle{
 			ColorName: theme.ColorNamePlaceHolder,
 			SizeName:  theme.SizeNameCaptionText,
@@ -363,9 +381,17 @@ func (ui *ChatUI) showMainUI() {
 		fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
 	peersStack := container.NewStack(ui.peerList, container.NewCenter(ui.emptyHint))
 
+	// 左下角：设置入口
+	ui.settingsBtn = widget.NewButtonWithIcon("设置", theme.SettingsIcon(), ui.showSettings)
+	ui.settingsBtn.Importance = widget.LowImportance
+	settingsBar := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewHBox(ui.settingsBtn, layout.NewSpacer()),
+	)
+
 	peersPanel := container.NewBorder(
 		container.NewVBox(peerTitle, widget.NewSeparator()),
-		nil, nil, nil,
+		settingsBar, nil, nil,
 		peersStack)
 
 	// ===== 右侧：聊天区 =====
@@ -430,6 +456,85 @@ func (ui *ChatUI) showMainUI() {
 
 	// 控件全部创建完毕，允许回调更新UI
 	ui.ready = true
+}
+
+// headerInfoText 顶部栏的本机信息文本（含当前接收目录）
+func (ui *ChatUI) headerInfoText() string {
+	return fmt.Sprintf("代号 %s    IP %s    TCP端口 %d    接收目录 %s",
+		ui.client.GetName(), ui.client.LocalIP(), ui.client.TCPPort(), ui.client.FileDataDir())
+}
+
+// refreshHeaderInfo 刷新顶部栏信息（接收目录变化后调用）
+func (ui *ChatUI) refreshHeaderInfo() {
+	if ui.headerInfo == nil || ui.client == nil {
+		return
+	}
+	ui.headerInfo.Segments = []widget.RichTextSegment{&widget.TextSegment{
+		Text: ui.headerInfoText(),
+		Style: widget.RichTextStyle{
+			ColorName: theme.ColorNamePlaceHolder,
+			SizeName:  theme.SizeNameCaptionText,
+			Inline:    false,
+		},
+	}}
+	ui.headerInfo.Refresh()
+}
+
+// showSettings 打开设置对话框：选择接收文件的保存位置
+func (ui *ChatUI) showSettings() {
+	if ui.client == nil {
+		return
+	}
+
+	dirEntry := widget.NewEntry()
+	dirEntry.SetText(ui.client.FileDataDir())
+	dirEntry.SetPlaceHolder("选择或输入保存目录")
+
+	browseBtn := widget.NewButtonWithIcon("浏览…", theme.FolderOpenIcon(), func() {
+		fd := dialog.NewFolderOpen(func(lu fyne.ListableURI, err error) {
+			if err != nil || lu == nil {
+				return
+			}
+			dirEntry.SetText(windowsPath(lu.Path()))
+		}, ui.win)
+		fd.Show()
+		fd.Resize(fyne.NewSize(700, 500))
+	})
+
+	dirRow := container.NewBorder(nil, nil, nil, browseBtn, dirEntry)
+
+	hint := widget.NewRichText(&widget.TextSegment{
+		Text: "收到的文件和文件夹会保存到这里，修改后立即生效，下次启动仍会沿用。",
+		Style: widget.RichTextStyle{
+			ColorName: theme.ColorNamePlaceHolder,
+			SizeName:  theme.SizeNameCaptionText,
+			Inline:    false,
+		},
+	})
+
+	content := container.NewVBox(
+		widget.NewLabelWithStyle("接收文件的保存位置", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		dirRow,
+		hint,
+	)
+
+	d := dialog.NewCustomConfirm("设置", "保存", "取消", content, func(ok bool) {
+		if !ok {
+			return
+		}
+		dir := strings.TrimSpace(dirEntry.Text)
+		if err := ui.client.SetFileDataDir(dir); err != nil {
+			dialog.ShowError(err, ui.win)
+			return
+		}
+		if ui.prefs != nil {
+			ui.prefs.SetString(prefKeyReceiveDir, dir)
+		}
+		ui.refreshHeaderInfo()
+		ui.appendLog("[系统] 接收文件的保存位置已改为: " + dir)
+	}, ui.win)
+	d.Show()
+	d.Resize(fyne.NewSize(580, 240))
 }
 
 // appendLog 向聊天日志追加一行，并自动滚动到底部保证新消息可见

@@ -16,3 +16,9 @@
 
 # Inno Setup 编译产物 (安装包不入库, 上传到 Partner Center / GitHub Releases)
 
+# MSIX 构建中间目录与产物
+msix/stage/
+dist/
+
+# 字体子集化临时目录
+.fontwork/

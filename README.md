@@ -1,12 +1,12 @@
 # 项目介绍
 
 在同一网络下,安装此软件的多台电脑之间,可以发现对方设备,彼此之间进行聊天和文件互传。免登录,无需注册账号。方便快捷。
+### 本项目已上架 Microsoft Store,可直接在Windows Store搜索[LocalCP](https://apps.microsoft.com/detail/9NLXCD3RLH6R?hl=zh-cn&gl=CN&ocid=pdpshare)下载使用。
 
-## 运行方法
 
-### 仓库中提供了windows版本的安装包
+#### 仓库中提供了windows版本的软件程序
 
-- 文件夹 downloads\v0.0.3\LoacalCP-setup-0.0.3.exe可直接使用
+- 根目录中 localchat.exe可以直接下载到桌面运行使用
 
 ###### 运行效果演示
 
@@ -42,7 +42,7 @@ go install fyne.io/fyne/v2/cmd/fyne@latest
 
 ###### 打包
 
-# windows打包命令:
+##### windows打包命令:
 
 ```Go
 fyne package -os windows -icon 1.ico -release -app-id com.ggbond.boom
