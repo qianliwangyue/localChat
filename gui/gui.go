@@ -117,11 +117,14 @@ func brandLogo(size float32) fyne.CanvasObject {
 // prefKeyReceiveDir 接收文件保存位置的偏好键
 const prefKeyReceiveDir = "receiveDir"
 
+// windowTitle 主窗口标题，同时被通知模块用于 Win32 API 定位窗口（判断是否最小化）
+const windowTitle = "LocalChat - 局域网聊天与文件传输"
+
 // Run 启动图形界面应用
 func Run() {
 	a := app.New()
 	a.Settings().SetTheme(&apptheme.MyTheme{})
-	w := a.NewWindow("LocalChat - 局域网聊天与文件传输")
+	w := a.NewWindow(windowTitle)
 	w.Resize(fyne.NewSize(480, 540))
 	w.SetMaster()
 
@@ -254,6 +257,10 @@ func (ui *ChatUI) bindCallbacks() {
 		ui.uiDo(func() {
 			ui.appendLog(fmt.Sprintf("[%s]: %s", from, content))
 		})
+		// 窗口最小化时弹出系统通知并响铃提醒
+		if isMainWindowMinimized() {
+			notifyDesktop("聊天消息", fmt.Sprintf("%s：\n%s", from, content))
+		}
 	}
 
 	c.OnChatEnded = func() {
@@ -318,6 +325,10 @@ func (ui *ChatUI) bindCallbacks() {
 			ui.endProgress()
 			ui.appendLog(text)
 		})
+		// 窗口最小化时弹出系统通知（传输完成/取消/失败等最终状态）并响铃提醒
+		if isMainWindowMinimized() {
+			notifyDesktop("文件消息", text)
+		}
 	}
 
 	c.OnFileSaved = func(fileName, savePath string) {
