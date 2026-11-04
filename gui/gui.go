@@ -3,6 +3,7 @@ package gui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -488,6 +489,11 @@ func (ui *ChatUI) showMainUI() {
 		}, ui.win)
 	})
 
+	// 拖拽文件/文件夹到聊天记录区域即可发送给当前聊天对象
+	ui.win.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
+		ui.handleDropped(pos, uris)
+	})
+
 	// 控件全部创建完毕，允许回调更新UI
 	ui.ready = true
 }
@@ -698,6 +704,51 @@ func (ui *ChatUI) pickFile() {
 	// Show前调用Resize会触发MinSize解引用nil而panic（fyne 2.8.1）
 	fd.Show()
 	fd.Resize(fyne.NewSize(700, 500))
+}
+
+// handleDropped 处理拖入的文件/文件夹：仅当松手位置在聊天记录区域内，
+// 且正处于聊天中时，自动发送给当前聊天对象。文件夹走文件夹传输，普通文件走文件传输。
+func (ui *ChatUI) handleDropped(pos fyne.Position, uris []fyne.URI) {
+	if len(uris) == 0 || !ui.dropInsideChat(pos) {
+		return
+	}
+	if !ui.client.IsInChat() {
+		ui.uiDo(func() { ui.appendLog("[系统] 请先开始一个聊天会话，再拖入文件发送") })
+		return
+	}
+	for _, u := range uris {
+		if u == nil || u.Scheme() != "file" {
+			continue
+		}
+		path := windowsPath(u.Path())
+		info, err := os.Stat(path)
+		if err != nil {
+			p := path
+			ui.uiDo(func() { ui.appendLog("[系统] 无法访问拖入的项目: " + p) })
+			continue
+		}
+		if info.IsDir() {
+			go ui.client.SendFolder(path)
+		} else {
+			go ui.client.SendFile(path)
+		}
+	}
+}
+
+// dropInsideChat 判断拖放松手点是否落在聊天记录区域（蓝色框）内。
+// Windows 下拖放走 OLE，Fyne 回调里的坐标是拖拽开始前的旧值，
+// 因此用系统实时光标位置换算成画布坐标后再判断。
+func (ui *ChatUI) dropInsideChat(pos fyne.Position) bool {
+	if ui.chatScroll == nil {
+		return false
+	}
+	if p, ok := cursorCanvasPos(ui.win.Canvas().Size().Width); ok {
+		pos = p
+	}
+	origin := fyne.CurrentApp().Driver().AbsolutePositionForObject(ui.chatScroll)
+	size := ui.chatScroll.Size()
+	return pos.X >= origin.X && pos.Y >= origin.Y &&
+		pos.X <= origin.X+size.Width && pos.Y <= origin.Y+size.Height
 }
 
 // pickFolder 选择并发送文件夹

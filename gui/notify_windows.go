@@ -11,35 +11,12 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
-	"unsafe"
 
 	"golang.org/x/sys/windows/registry"
 )
 
 //go:embed toast.ico
 var toastIconData []byte
-
-var (
-	user32          = syscall.NewLazyDLL("user32.dll")
-	procFindWindow  = user32.NewProc("FindWindowW")
-	procIsIconic    = user32.NewProc("IsIconic")
-	procMessageBeep = user32.NewProc("MessageBeep")
-)
-
-// isMainWindowMinimized 通过 Win32 API 判断主窗口当前是否处于最小化状态。
-// 找不到窗口（标题不匹配等）时按「未最小化」处理，避免误发通知。
-func isMainWindowMinimized() bool {
-	titlePtr, err := syscall.UTF16PtrFromString(windowTitle)
-	if err != nil {
-		return false
-	}
-	hwnd, _, _ := procFindWindow.Call(0, uintptr(unsafe.Pointer(titlePtr)))
-	if hwnd == 0 {
-		return false
-	}
-	iconic, _, _ := procIsIconic.Call(hwnd)
-	return iconic != 0
-}
 
 // toastAppID 是通知的 AUMID（AppUserModelID）。
 // 通过注册表注册显示名后，通知顶部会显示「LocalCP」而不是一串 GUID。
