@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	apptheme "localchat/gui/theme"
 	"localchat/pkg/common"
@@ -47,13 +48,17 @@ type ChatUI struct {
 
 	pendingDirWarning string // 启动时接收目录回退的提示，等主界面就绪后再写入日志
 
-	// 传输进度对话框（进度条 + 取消按钮）
+	// 传输进度对话框（进度条 + 大小/速度信息 + 取消按钮）
 	progressDlg     dialog.Dialog
 	progressBar     *widget.ProgressBar
+	progressInfo    *widget.Label // 进度条下方的大小/速度明细
 	progressBtn     *widget.Button
 	progressLabel   string
 	progressSending bool
 	lastPct         int
+	lastWritten     int64     // 上次速度采样的已传字节
+	lastSpeedAt     time.Time // 上次速度采样时间
+	speed           float64   // 平滑后的传输速度（字节/秒）
 
 	ready bool // 主界面控件是否已创建
 }
@@ -309,8 +314,8 @@ func (ui *ChatUI) bindCallbacks() {
 		})
 	}
 
-	c.OnFileProgress = func(pct int, sending bool, label string) {
-		ui.uiDo(func() { ui.updateProgress(pct, sending, label) })
+	c.OnFileProgress = func(p types.TransferProgress) {
+		ui.uiDo(func() { ui.updateProgress(p) })
 	}
 
 	// 断点续传开始：在进度条上方留下一条提示，用户能看到不是从头再传
@@ -778,36 +783,71 @@ func windowsPath(p string) string {
 }
 
 // updateProgress 显示/更新传输进度对话框。
-// 进度条下方带一个「取消」按钮，点击后二次确认是否放弃传输。
-func (ui *ChatUI) updateProgress(pct int, sending bool, label string) {
+// 进度条下方显示「文件序号、大小、速度」明细，再往下是「取消」按钮（二次确认后放弃）。
+func (ui *ChatUI) updateProgress(p types.TransferProgress) {
 	// 标题或方向变化时重建对话框
-	if ui.progressDlg == nil || label != ui.progressLabel || sending != ui.progressSending {
+	if ui.progressDlg == nil || p.Label != ui.progressLabel || p.Sending != ui.progressSending {
 		if ui.progressDlg != nil {
 			ui.progressDlg.Hide()
 		}
-		ui.progressSending = sending
+		ui.progressSending = p.Sending
 		ui.progressBar = widget.NewProgressBar()
+		ui.progressInfo = widget.NewLabel("")
+		ui.progressInfo.TextStyle = fyne.TextStyle{Monospace: true}
+		ui.lastWritten, ui.lastSpeedAt, ui.speed = 0, time.Time{}, 0
 
 		ui.progressBtn = widget.NewButtonWithIcon("取消", theme.CancelIcon(), nil)
 		btn := ui.progressBtn
-		btn.OnTapped = func() { ui.confirmAbortTransfer(sending) }
+		btn.OnTapped = func() { ui.confirmAbortTransfer(p.Sending) }
 
 		// 固定最小宽度 300：默认对话框按内容自适应，进度条会窄得没法看
 		body := container.NewVBox(
-			widget.NewLabel(label),
+			widget.NewLabel(p.Label),
 			ui.progressBar,
+			ui.progressInfo,
 			container.NewCenter(btn),
 		)
 		content := container.NewPadded(container.New(&maxWidthLayout{w: 300}, body))
 		ui.progressDlg = dialog.NewCustomWithoutButtons("文件传输", content, ui.win)
 		ui.progressDlg.Show()
-		ui.progressLabel = label
+		ui.progressLabel = p.Label
 		ui.lastPct = -1
 	}
-	if pct != ui.lastPct {
-		ui.progressBar.SetValue(float64(pct) / 100)
-		ui.lastPct = pct
+	if p.Pct != ui.lastPct {
+		ui.progressBar.SetValue(float64(p.Pct) / 100)
+		ui.lastPct = p.Pct
 	}
+	ui.updateSpeed(p.Written)
+	ui.progressInfo.SetText(ui.transferInfoText(p))
+}
+
+// updateSpeed 根据 progress 回调周期采样计算平滑传输速度（字节/秒）
+func (ui *ChatUI) updateSpeed(written int64) {
+	now := time.Now()
+	if !ui.lastSpeedAt.IsZero() {
+		dt := now.Sub(ui.lastSpeedAt).Seconds()
+		if dt > 0.01 {
+			inst := float64(written-ui.lastWritten) / dt
+			if ui.speed <= 0 || inst < ui.speed*0.2 || inst > ui.speed*5 {
+				ui.speed = inst // 速度突变（新文件/续传）时直接跟随，避免旧值拖尾
+			} else {
+				ui.speed = ui.speed*0.6 + inst*0.4 // 常规情况指数平滑
+			}
+		}
+	}
+	ui.lastWritten = written
+	ui.lastSpeedAt = now
+}
+
+// transferInfoText 生成进度条下方的明细文本：大小、速度
+func (ui *ChatUI) transferInfoText(p types.TransferProgress) string {
+	speedText := "计算中…"
+	if ui.speed > 0 {
+		speedText = types.FormatFileSize(int64(ui.speed)) + "/s"
+	}
+	return fmt.Sprintf("大小 %s / %s    速度 %s",
+		types.FormatFileSize(p.Written), types.FormatFileSize(p.Total),
+		speedText)
 }
 
 // confirmAbortTransfer 二次确认是否放弃传输：选「是」停止，选「否」继续。

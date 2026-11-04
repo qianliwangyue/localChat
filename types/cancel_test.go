@@ -269,13 +269,13 @@ func TestCancelProgressCallbackOrder(t *testing.T) {
 		var evMu sync.Mutex
 		var order []string
 		record := func(e string) { evMu.Lock(); order = append(order, e); evMu.Unlock() }
-		a.OnFileProgress = func(pct int, sending bool, label string) { record("p") }
+		a.OnFileProgress = func(p TransferProgress) { record("p") }
 		a.OnTransferEnded = func(sending bool, text string) {
 			if sending {
 				record("e")
 			}
 		}
-		b.OnFileProgress = func(pct int, sending bool, label string) { record("p") }
+		b.OnFileProgress = func(p TransferProgress) { record("p") }
 		b.OnTransferEnded = func(sending bool, text string) {
 			if !sending {
 				record("e")

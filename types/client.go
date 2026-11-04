@@ -87,7 +87,7 @@ type ChatClient struct {
 	OnChatEnded       func()                                                                              // 聊天会话结束
 	OnFileOffer       func(from, fromAddr, fileName string, size int64, fileID string)                    // 收到文件请求（fromAddr为发送者IP，用于同名用户区分）
 	OnFolderOffer     func(from, fromAddr, folderName string, size int64, fileCount int, folderID string) // 收到文件夹请求
-	OnFileProgress    func(pct int, sending bool, label string)                                           // 传输进度
+	OnFileProgress    func(TransferProgress)                                                              // 传输进度（含大小/速度所需字节信息）
 	OnTransferEnded   func(sending bool, text string)                                                     // 传输结束（完成/拒绝/取消）
 	OnFileSaved       func(fileName, savePath string)                                                     // 单文件接收完成（含保存路径）
 	OnTransferResumed func(fileName string, offset, total int64)                                          // 断点续传开始（已续传偏移/文件总大小）
@@ -1863,6 +1863,16 @@ func (c *ChatClient) finalizeReceivingFile(msg *common.Message) {
 		savePath = final
 	}
 
+	// 文件夹中的文件成功落地：累计到文件夹的整体进度
+	if tf.FolderID != "" {
+		c.fileMutex.Lock()
+		if f, ok := c.receivingFolders[tf.FolderID]; ok {
+			f.DoneBytes += written
+			f.CurrentFile++
+		}
+		c.fileMutex.Unlock()
+	}
+
 	if c.OnTransferEnded != nil && tf.FolderID == "" {
 		c.OnTransferEnded(false, fmt.Sprintf("文件 '%s' 接收完成", msg.FileName))
 	}
@@ -2253,10 +2263,19 @@ func (c *ChatClient) sendFilesInFolder(folderID string) {
 			return
 		}
 
+		transferFolder.DoneBytes += transferFile.FileSize
 		transferFolder.CurrentFile++
-		fileProgress := int(float64(transferFolder.CurrentFile) / float64(transferFolder.TotalFiles) * 100)
+		fileProgress := int(float64(transferFolder.DoneBytes) / float64(transferFolder.FolderSize) * 100)
 		if c.OnFileProgress != nil {
-			c.OnFileProgress(fileProgress, true, fmt.Sprintf("发送文件夹 %s (%d/%d 个文件)", transferFolder.FolderName, transferFolder.CurrentFile, transferFolder.TotalFiles))
+			c.OnFileProgress(TransferProgress{
+				Sending:   true,
+				Pct:       fileProgress,
+				Label:     fmt.Sprintf("发送文件夹 %s (%d/%d 个文件)", transferFolder.FolderName, transferFolder.CurrentFile, transferFolder.TotalFiles),
+				Written:   transferFolder.DoneBytes,
+				Total:     transferFolder.FolderSize,
+				FileIndex: transferFolder.CurrentFile,
+				FileCount: transferFolder.TotalFiles,
+			})
 		}
 	}
 
@@ -2540,7 +2559,29 @@ func (c *ChatClient) sendFileData(fileID string, resume int64, proto2 bool) {
 		fire := !transferFile.Canceled && c.OnFileProgress != nil && progress != lastPct &&
 			(progress >= 100 || time.Since(lastReport) >= progressInterval)
 		if fire {
-			c.OnFileProgress(progress, true, fmt.Sprintf("发送文件 %s", transferFile.FileName))
+			prog := TransferProgress{
+				Sending:   true,
+				Pct:       progress,
+				Label:     fmt.Sprintf("发送文件 %s", transferFile.FileName),
+				Written:   transferFile.Sent,
+				Total:     transferFile.FileSize,
+				FileIndex: 1,
+				FileCount: 1,
+				FileName:  transferFile.FileName,
+			}
+			// 文件夹中的文件：换成整体进度与累计字节
+			if transferFile.FolderID != "" {
+				if f, ok := c.sendingFolders[transferFile.FolderID]; ok {
+					prog.Written = f.DoneBytes + transferFile.Sent
+					prog.Total = f.FolderSize
+					prog.FileIndex = f.CurrentFile + 1
+					prog.FileCount = f.TotalFiles
+					if prog.Total > 0 {
+						prog.Pct = int(float64(prog.Written) / float64(prog.Total) * 100)
+					}
+				}
+			}
+			c.OnFileProgress(prog)
 			lastPct = progress
 			lastReport = time.Now()
 		}
@@ -2702,7 +2743,29 @@ func (c *ChatClient) writeReceivedChunk(msg *common.Message, data []byte) {
 	fileName := transferFile.FileName
 	savePath, key, size := transferFile.FilePath, transferFile.FileKey, transferFile.FileSize
 	if notify {
-		c.OnFileProgress(pct, false, fmt.Sprintf("接收文件 %s", fileName))
+		prog := TransferProgress{
+			Sending:   false,
+			Pct:       pct,
+			Label:     fmt.Sprintf("接收文件 %s", fileName),
+			Written:   transferFile.Written,
+			Total:     transferFile.FileSize,
+			FileIndex: 1,
+			FileCount: 1,
+			FileName:  fileName,
+		}
+		// 文件夹中的文件：换成整体进度与累计字节
+		if transferFile.FolderID != "" {
+			if f, ok := c.receivingFolders[transferFile.FolderID]; ok {
+				prog.Written = f.DoneBytes + transferFile.Written
+				prog.Total = f.FolderSize
+				prog.FileIndex = f.CurrentFile + 1
+				prog.FileCount = f.TotalFiles
+				if prog.Total > 0 {
+					prog.Pct = int(float64(prog.Written) / float64(prog.Total) * 100)
+				}
+			}
+		}
+		c.OnFileProgress(prog)
 	}
 	c.fileMutex.Unlock()
 

@@ -47,7 +47,22 @@ type TransferringFolder struct {
 	CurrentFile int
 	TotalFiles  int
 	Files       []string // 文件列表
+	DoneBytes   int64    // 已完成文件的累计字节数（用于整体进度/速度统计）
 
 	// 发送端取消标记：写操作必须在 fileMutex 内，读操作用 isFolderCanceled()
 	Canceled bool
+}
+
+// TransferProgress 传输进度信息，回调给 UI 显示大小/速度等明细。
+// 单文件传输：Written/Total 为该文件的字节，FileIndex/FileCount 恒为 1/1；
+// 文件夹传输：Written/Total 为整个文件夹的累计字节，FileIndex/FileCount 为文件序号。
+type TransferProgress struct {
+	Sending   bool
+	Pct       int    // 百分比 0-100（文件夹为整体进度）
+	Label     string // 对话框显示的标题文本
+	Written   int64  // 已完成字节数
+	Total     int64  // 总字节数
+	FileIndex int    // 当前第几个文件（从 1 开始）
+	FileCount int    // 文件总数
+	FileName  string // 当前文件名
 }

@@ -81,7 +81,7 @@ func TestE2E(t *testing.T) {
 		defer mu.Unlock()
 		aMsgs = append(aMsgs, from+":"+content)
 	}
-	a.OnFileProgress = func(pct int, sending bool, label string) { t.Logf("[A进度] %d%% %s", pct, label) }
+	a.OnFileProgress = func(p TransferProgress) { t.Logf("[A进度] %d%% %s", p.Pct, p.Label) }
 	a.OnTransferEnded = func(sending bool, text string) { t.Logf("[A传输结束] %v %s", sending, text) }
 
 	// ===== 客户端B（Bob，被动方） =====
@@ -94,7 +94,7 @@ func TestE2E(t *testing.T) {
 	b.OnChatStarted = func(peerName string) { bChatStarted <- peerName }
 	b.OnChatMessage = func(from, content string) { bMsgs <- from + ":" + content }
 	b.OnChatEnded = func() { bChatEnded <- true }
-	b.OnFileProgress = func(pct int, sending bool, label string) { t.Logf("[B进度] %d%% %s", pct, label) }
+	b.OnFileProgress = func(p TransferProgress) { t.Logf("[B进度] %d%% %s", p.Pct, p.Label) }
 	b.OnTransferEnded = func(sending bool, text string) { t.Logf("[B传输结束] %v %s", sending, text) }
 	// 收到文件请求自动接受
 	b.OnFileOffer = func(from, fromAddr, fileName string, size int64, fileID string) {
