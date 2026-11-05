@@ -11,4 +11,4 @@ func isMainWindowMinimized() bool { return false }
 // cursorCanvasPos 非 Windows 平台直接退回 Fyne 回调给的坐标
 func cursorCanvasPos(float32) (fyne.Position, bool) { return fyne.Position{}, false }
 
-func notifyDesktop(string, string) {}
+func notifyDesktop(string) {}

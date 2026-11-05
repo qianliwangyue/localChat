@@ -45,6 +45,7 @@ type ChatUI struct {
 	statusDot   *canvas.Circle   // 聊天标题旁的状态点
 	headerInfo  *widget.RichText // 顶部栏本机信息（小字）
 	settingsBtn *widget.Button   // 左下角设置入口
+	phoneBtn    *widget.Button   // 左下角手机互传入口
 
 	pendingDirWarning string // 启动时接收目录回退的提示，等主界面就绪后再写入日志
 
@@ -59,6 +60,12 @@ type ChatUI struct {
 	lastWritten     int64     // 上次速度采样的已传字节
 	lastSpeedAt     time.Time // 上次速度采样时间
 	speed           float64   // 平滑后的传输速度（字节/秒）
+
+	// 手机互传（临时 HTTP 服务 + 二维码）
+	phone         *phoneTransfer
+	phoneDlg      dialog.Dialog
+	phoneDropMode bool              // 手机互传拖拽发送对话框打开中
+	phoneDropZone fyne.CanvasObject // 拖拽发送区域（用于命中判断）
 
 	ready bool // 主界面控件是否已创建
 }
@@ -265,7 +272,7 @@ func (ui *ChatUI) bindCallbacks() {
 		})
 		// 窗口最小化时弹出系统通知并响铃提醒
 		if isMainWindowMinimized() {
-			notifyDesktop("聊天消息", fmt.Sprintf("%s：\n%s", from, content))
+			notifyDesktop(fmt.Sprintf("%s：\n%s", from, content))
 		}
 	}
 
@@ -333,7 +340,7 @@ func (ui *ChatUI) bindCallbacks() {
 		})
 		// 窗口最小化时弹出系统通知（传输完成/取消/失败等最终状态）并响铃提醒
 		if isMainWindowMinimized() {
-			notifyDesktop("文件消息", text)
+			notifyDesktop(text)
 		}
 	}
 
@@ -409,12 +416,14 @@ func (ui *ChatUI) showMainUI() {
 		fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
 	peersStack := container.NewStack(ui.peerList, container.NewCenter(ui.emptyHint))
 
-	// 左下角：设置入口
+	// 左下角：设置入口 + 手机互传
 	ui.settingsBtn = widget.NewButtonWithIcon("设置", theme.SettingsIcon(), ui.showSettings)
 	ui.settingsBtn.Importance = widget.LowImportance
+	ui.phoneBtn = widget.NewButtonWithIcon("手机互传", theme.DownloadIcon(), ui.showPhoneTransfer)
+	ui.phoneBtn.Importance = widget.LowImportance
 	settingsBar := container.NewVBox(
 		widget.NewSeparator(),
-		container.NewHBox(ui.settingsBtn, layout.NewSpacer()),
+		container.NewHBox(ui.settingsBtn, ui.phoneBtn, layout.NewSpacer()),
 	)
 
 	peersPanel := container.NewBorder(
@@ -487,10 +496,11 @@ func (ui *ChatUI) showMainUI() {
 	// 关闭窗口时优雅退出
 	ui.win.SetCloseIntercept(func() {
 		dialog.ShowConfirm("退出", "确定退出 LocalChat？", func(ok bool) {
-			if ok {
-				go ui.client.Stop()
-				fyne.CurrentApp().Quit()
-			}
+		if ok {
+			ui.stopPhoneServer()
+			go ui.client.Stop()
+			fyne.CurrentApp().Quit()
+		}
 		}, ui.win)
 	})
 
@@ -633,6 +643,9 @@ func (e *readOnlyEntry) TappedSecondary(ev *fyne.PointEvent) {
 
 // appendLog 向聊天日志追加一行，并自动滚动到底部保证新消息可见
 func (ui *ChatUI) appendLog(text string) {
+	if ui.chatLog == nil { // 控件未创建时（测试/启动早期）忽略
+		return
+	}
 	ui.chatLog.SetText(ui.chatLog.Text + text + "\n")
 	ui.chatScroll.ScrollToBottom()
 }
@@ -711,9 +724,14 @@ func (ui *ChatUI) pickFile() {
 	fd.Resize(fyne.NewSize(700, 500))
 }
 
-// handleDropped 处理拖入的文件/文件夹：仅当松手位置在聊天记录区域内，
-// 且正处于聊天中时，自动发送给当前聊天对象。文件夹走文件夹传输，普通文件走文件传输。
+// handleDropped 处理拖入的文件/文件夹：手机互传拖拽对话框打开时优先路由到手机发送；
+// 否则仅当松手位置在聊天记录区域内且正处于聊天中时，自动发送给当前聊天对象。
+// 文件夹走文件夹传输，普通文件走文件传输。
 func (ui *ChatUI) handleDropped(pos fyne.Position, uris []fyne.URI) {
+	if ui.phoneDropMode {
+		ui.handlePhoneDropped(pos, uris)
+		return
+	}
 	if len(uris) == 0 || !ui.dropInsideChat(pos) {
 		return
 	}
