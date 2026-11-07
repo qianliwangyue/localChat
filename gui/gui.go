@@ -135,7 +135,7 @@ const windowTitle = "LocalChat - 局域网聊天与文件传输"
 
 // Run 启动图形界面应用
 func Run() {
-	a := app.New()
+	a := app.NewWithID("com.ggbond.boom") // 唯一 ID：偏好存储需要（app.New() 会告警）
 	a.Settings().SetTheme(&apptheme.MyTheme{})
 	w := a.NewWindow(windowTitle)
 	w.Resize(fyne.NewSize(480, 540))
@@ -143,6 +143,9 @@ func Run() {
 
 	ui := &ChatUI{win: w, prefs: a.Preferences()}
 	ui.showNameSetup()
+	// 启动输入法候选窗跟随（修复 fyne/GLFW 不调用 ImmSetCandidateWindow 导致
+	// 中文候选词固定出现在窗口默认位置、不跟随输入光标的问题）
+	startImeTracker(w)
 	w.ShowAndRun()
 }
 
